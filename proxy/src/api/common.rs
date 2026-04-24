@@ -134,6 +134,10 @@ pub struct ModelStartRow {
     /// JSON blob; deserialized into [`ModelRuntimeOverrides`] in the start path.
     /// Stored as text per the `runtime_overrides` column.
     pub runtime_overrides: String,
+    /// Companion mmproj filename (bare; no directory prefix). Set by 7b's
+    /// download path and by 7a's startup backfill. When `Some`, the container
+    /// start path composes `<safe_repo>/<this>` into `LlamacppConfig::mmproj_path`.
+    pub mmproj_filename: Option<String>,
 }
 
 /// Core container-start logic shared between admin and reservation handlers.
@@ -146,7 +150,7 @@ pub async fn start_container_core(
 ) -> Result<(String, String), axum::response::Response> {
     // Look up the model
     let model: Option<ModelStartRow> = sqlx::query_as(
-        "SELECT id, hf_repo, filename, backend_type, context_length, runtime_overrides FROM models WHERE id = ?",
+        "SELECT id, hf_repo, filename, backend_type, context_length, runtime_overrides, mmproj_filename FROM models WHERE id = ?",
     )
     .bind(&params.model_id)
     .fetch_optional(&state.db.pool)
@@ -160,6 +164,7 @@ pub async fn start_container_core(
         backend_type: db_backend_type,
         context_length: db_context_length,
         runtime_overrides: runtime_overrides_json,
+        mmproj_filename,
     } = model.ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
@@ -203,6 +208,13 @@ pub async fn start_container_core(
                 }
             };
 
+            // Same `<safe_repo>/<bare>` composition as gguf_path — the column
+            // stores the bare filename only. File-existence is re-verified
+            // inside build_llamacpp_cmd before the --mmproj flag is emitted.
+            let mmproj_path = mmproj_filename
+                .as_ref()
+                .map(|f| format!("{}/{}", safe_repo, f));
+
             let parallel = params.parallel.unwrap_or(1).max(1);
             // A bad JSON blob in the DB shouldn't keep the model from starting —
             // fall back to defaults (i.e. no overrides) and carry on.
@@ -211,7 +223,7 @@ pub async fn start_container_core(
             let llamacpp_config = crate::docker::llamacpp::LlamacppConfig {
                 model_id: model_id.clone(),
                 gguf_path,
-                mmproj_path: None,
+                mmproj_path,
                 gpu_type: crate::docker::llamacpp::GpuType::from_str(
                     params.gpu_type.as_deref().unwrap_or("none"),
                 ),
@@ -506,5 +518,61 @@ mod tests {
         assert!(statuses[0].healthy);
         assert!(!statuses[1].healthy);
         assert_eq!(statuses[1].state.as_deref(), Some("paused"));
+    }
+
+    // -----------------------------------------------------------------------
+    // ModelStartRow: the SELECT must carry mmproj_filename through to the
+    // struct so start_container_core can wire it into LlamacppConfig.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn model_start_row_reads_mmproj_filename() {
+        let db = crate::db::Database::test_db().await;
+        sqlx::query(
+            "INSERT INTO models (id, hf_repo, filename, backend_type, loaded, mmproj_filename) \
+             VALUES (?, ?, ?, 'llamacpp', 0, ?)",
+        )
+        .bind("m-with-mmproj")
+        .bind("owner/repo")
+        .bind("model.gguf")
+        .bind("mmproj-f16.gguf")
+        .execute(&db.pool)
+        .await
+        .expect("insert model");
+
+        let row: ModelStartRow = sqlx::query_as(
+            "SELECT id, hf_repo, filename, backend_type, context_length, runtime_overrides, mmproj_filename FROM models WHERE id = ?",
+        )
+        .bind("m-with-mmproj")
+        .fetch_one(&db.pool)
+        .await
+        .expect("fetch row");
+
+        assert_eq!(row.mmproj_filename.as_deref(), Some("mmproj-f16.gguf"));
+    }
+
+    #[tokio::test]
+    async fn model_start_row_mmproj_filename_is_none_for_text_only() {
+        let db = crate::db::Database::test_db().await;
+        sqlx::query(
+            "INSERT INTO models (id, hf_repo, filename, backend_type, loaded) \
+             VALUES (?, ?, ?, 'llamacpp', 0)",
+        )
+        .bind("m-text-only")
+        .bind("owner/repo")
+        .bind("model.gguf")
+        .execute(&db.pool)
+        .await
+        .expect("insert model");
+
+        let row: ModelStartRow = sqlx::query_as(
+            "SELECT id, hf_repo, filename, backend_type, context_length, runtime_overrides, mmproj_filename FROM models WHERE id = ?",
+        )
+        .bind("m-text-only")
+        .fetch_one(&db.pool)
+        .await
+        .expect("fetch row");
+
+        assert!(row.mmproj_filename.is_none());
     }
 }

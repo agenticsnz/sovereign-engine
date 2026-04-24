@@ -2,12 +2,13 @@
 
 Self-contained local AI inference platform. A Rust reverse proxy manages llama.cpp backend containers, provides OIDC authentication, fair-use scheduling, and a React dashboard — all in a single Docker image.
 
-**Version:** 1.5.2
+**Version:** 1.6.0
 
 ## Features
 
 - **OpenAI-compatible API** — drop-in replacement at `/v1/*` for any client that speaks OpenAI
 - **Multi-model support** — load and manage multiple models with GPU memory-aware scheduling
+- **Multimodal / vision** — auto-detects and loads companion mmproj projectors for vision-capable GGUFs (e.g. Gemma 4)
 - **Backend flexibility** — llama.cpp with NVIDIA CUDA, AMD ROCm, or CPU-only
 - **OIDC authentication** — connect any identity provider; bootstrap mode for initial setup
 - **API tokens** — per-user, SHA-256 hashed, manageable via dashboard or API

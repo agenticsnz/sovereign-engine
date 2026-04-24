@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-04-24
+
+### Added
+- First-class multimodal projector (mmproj) support for llama.cpp backends. Multimodal GGUFs (e.g. bartowski Gemma 4) now accept image input end-to-end through the proxy.
+- New nullable `models.mmproj_filename` column tracks the companion `mmproj-*.gguf` / `mmproj_*.gguf` sibling that pairs with the main quant (migration adds the column; `Model` struct and all `SELECT`s updated to expose it).
+- HuggingFace download flow auto-detects and fetches the preferred mmproj variant (f16 > bf16 > f32) alongside the main quant, bypassing any user-supplied `file_filter` so vision works out of the box; filename is persisted on the `models` row at ingestion.
+- Startup backfill scans on-disk model directories and populates `mmproj_filename` for models downloaded before this release — no re-download required. Prefers f16 variants and skips rows that already have a value.
+- `llama-server` is launched with `--mmproj /models/<path>` whenever a projector is present and readable; missing files degrade gracefully to text-only with a warning log.
+- Admin UI surfaces a "Vision" badge on model rows whose projector is loaded, with a tooltip showing the projector filename.
+
+### Changed
+- `LlamacppConfig` gained an optional `mmproj_path` field; `start_llamacpp()` now delegates command construction to a pure `build_llamacpp_cmd` helper, making the flag wiring unit-testable without Docker.
+- `AdminModel` TypeScript interface gained `mmproj_filename: string | null`.
+
+### Fixed
+- `api.agentics.org.nz` Gemma 4 deployments now accept image input. Previously returned HTTP 500 from llama.cpp with `"image input is not supported - hint: if this is unexpected, you may need to provide the mmproj"`. (Workflow card `019dbd5c-19b0-7ce2-85b9-834e20a3d88b`.)
+
 ## [1.5.2] - 2026-04-23
 
 ### Fixed

@@ -264,11 +264,15 @@ proxy/src/
 │   │                      lists managed containers by label (managed-by=sovereign-engine).
 │   │                      allocate_uid(): random UID in 10000–65000 with collision avoidance.
 │   │                      Dispatches start/stop to llama.cpp backend.
-│   └── llamacpp.rs      — LlamacppConfig struct. start_llamacpp(): creates container (CUDA, ROCm,
-│                          or CPU-only), bind mount for /models (read-only), internal network attachment,
-│                          unique UID, labels, per-container API key. Container named
-│                          sovereign-llamacpp-{model_id}. stop_llamacpp(): stop + remove.
-│                          check_llamacpp_health(): HTTP /health check.
+│   └── llamacpp.rs      — LlamacppConfig struct (includes optional mmproj_path for multimodal
+│                          projectors). start_llamacpp(): creates container (CUDA, ROCm, or
+│                          CPU-only), bind mount for /models (read-only), internal network
+│                          attachment, unique UID, labels, per-container API key. Container named
+│                          sovereign-llamacpp-{model_id}. Command construction is delegated to a
+│                          pure build_llamacpp_cmd() helper which emits --mmproj when a projector
+│                          is present and readable (missing files degrade to text-only with a
+│                          warning). stop_llamacpp(): stop + remove. check_llamacpp_health():
+│                          HTTP /health check.
 │
 ├── proxy/
 │   ├── mod.rs           — Proxy module declaration.

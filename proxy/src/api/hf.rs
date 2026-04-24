@@ -918,6 +918,61 @@ fn detect_mmproj_file(entries: &[HfFileEntry]) -> Option<String> {
 // Background download task — orchestrator
 // ---------------------------------------------------------------------------
 
+/// All fields needed to INSERT a freshly-downloaded model into the `models`
+/// table. Extracted into a struct so the INSERT is testable in isolation
+/// (see `insert_downloaded_model_*` tests) and so `run_download` stays a
+/// straight-line orchestrator.
+struct DownloadedModelRow {
+    model_id: String,
+    hf_repo: String,
+    primary_filename: Option<String>,
+    /// Companion multimodal-projector filename (7b). `None` for text-only
+    /// models; persisted at INSERT time so the row is correct without
+    /// relying on the startup-time backfill.
+    mmproj_filename: Option<String>,
+    size_bytes: i64,
+    category_id: Option<String>,
+    backend_type: String,
+    model_metadata: Option<String>,
+    gguf_meta: GgufMetadata,
+    kv_bpt_global: Option<i64>,
+    kv_bpt_swa: Option<i64>,
+    runtime_overrides_json: String,
+}
+
+/// Persist a freshly-downloaded model. Binds every column the download flow
+/// knows about — including `mmproj_filename` (7b) — so a fresh row does not
+/// depend on the startup backfill to become correct.
+async fn insert_downloaded_model(
+    pool: &sqlx::SqlitePool,
+    row: &DownloadedModelRow,
+) -> Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO models (id, hf_repo, filename, size_bytes, category_id, backend_type, model_metadata, context_length, n_layers, n_heads, n_kv_heads, embedding_length, key_length, value_length, sliding_window, kv_bytes_per_token_global, kv_bytes_per_token_swa, runtime_overrides, mmproj_filename) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&row.model_id)
+    .bind(&row.hf_repo)
+    .bind(&row.primary_filename)
+    .bind(row.size_bytes)
+    .bind(&row.category_id)
+    .bind(&row.backend_type)
+    .bind(&row.model_metadata)
+    .bind(row.gguf_meta.context_length.map(|v| v as i64))
+    .bind(row.gguf_meta.block_count.map(|v| v as i64))
+    .bind(row.gguf_meta.head_count.map(|v| v as i64))
+    .bind(row.gguf_meta.head_count_kv.map(|v| v as i64))
+    .bind(row.gguf_meta.embedding_length.map(|v| v as i64))
+    .bind(row.gguf_meta.key_length.map(|v| v as i64))
+    .bind(row.gguf_meta.value_length.map(|v| v as i64))
+    .bind(row.gguf_meta.sliding_window.map(|v| v as i64))
+    .bind(row.kv_bpt_global)
+    .bind(row.kv_bpt_swa)
+    .bind(&row.runtime_overrides_json)
+    .bind(&row.mmproj_filename)
+    .execute(pool)
+    .await
+}
+
 async fn run_download(
     app_state: Arc<AppState>,
     downloads: Downloads,
@@ -1038,32 +1093,23 @@ async fn run_download(
     // Step 11: Register model in DB
     let model_id = Uuid::new_v4().to_string();
     let size_bytes = total_downloaded as i64;
-    let bt = backend_type.as_deref().unwrap_or("llamacpp");
+    let bt = backend_type.as_deref().unwrap_or("llamacpp").to_string();
     let (kv_bpt_global, kv_bpt_swa) = compute_kv_aggregates(&gguf_meta);
-    match sqlx::query(
-        "INSERT INTO models (id, hf_repo, filename, size_bytes, category_id, backend_type, model_metadata, context_length, n_layers, n_heads, n_kv_heads, embedding_length, key_length, value_length, sliding_window, kv_bytes_per_token_global, kv_bytes_per_token_swa, runtime_overrides) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&model_id)
-    .bind(&hf_repo)
-    .bind(&primary_filename)
-    .bind(size_bytes)
-    .bind(&category_id)
-    .bind(bt)
-    .bind(&model_metadata)
-    .bind(gguf_meta.context_length.map(|v| v as i64))
-    .bind(gguf_meta.block_count.map(|v| v as i64))
-    .bind(gguf_meta.head_count.map(|v| v as i64))
-    .bind(gguf_meta.head_count_kv.map(|v| v as i64))
-    .bind(gguf_meta.embedding_length.map(|v| v as i64))
-    .bind(gguf_meta.key_length.map(|v| v as i64))
-    .bind(gguf_meta.value_length.map(|v| v as i64))
-    .bind(gguf_meta.sliding_window.map(|v| v as i64))
-    .bind(kv_bpt_global)
-    .bind(kv_bpt_swa)
-    .bind(runtime_overrides_json)
-    .execute(&app_state.db.pool)
-    .await
-    {
+    let row = DownloadedModelRow {
+        model_id: model_id.clone(),
+        hf_repo: hf_repo.clone(),
+        primary_filename,
+        mmproj_filename,
+        size_bytes,
+        category_id,
+        backend_type: bt,
+        model_metadata,
+        gguf_meta,
+        kv_bpt_global,
+        kv_bpt_swa,
+        runtime_overrides_json: runtime_overrides_json.to_string(),
+    };
+    match insert_downloaded_model(&app_state.db.pool, &row).await {
         Ok(_) => {
             info!(
                 hf_repo = %hf_repo,
@@ -2470,5 +2516,76 @@ mod tests {
     #[test]
     fn should_include_no_filter_accepts_mmproj() {
         assert!(should_include("mmproj-foo-f16.gguf", None));
+    }
+
+    // -- insert_downloaded_model (INSERT binding test) -----------------------
+
+    #[tokio::test]
+    async fn insert_downloaded_model_persists_mmproj_filename() {
+        // Drive the INSERT helper with a known mmproj filename and assert
+        // the row is persisted with the expected value. Proves the download
+        // flow populates mmproj_filename at INSERT time (no restart needed).
+        let db = crate::db::Database::test_db().await;
+
+        let row = DownloadedModelRow {
+            model_id: "model-with-mmproj".to_string(),
+            hf_repo: "owner/repo".to_string(),
+            primary_filename: Some("model-q4.gguf".to_string()),
+            mmproj_filename: Some("mmproj-foo-f16.gguf".to_string()),
+            size_bytes: 1_234,
+            category_id: None,
+            backend_type: "llamacpp".to_string(),
+            model_metadata: None,
+            gguf_meta: GgufMetadata::default(),
+            kv_bpt_global: None,
+            kv_bpt_swa: None,
+            runtime_overrides_json: "{}".to_string(),
+        };
+
+        insert_downloaded_model(&db.pool, &row)
+            .await
+            .expect("insert succeeds");
+
+        let (fname, mmproj): (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT filename, mmproj_filename FROM models WHERE id = ?")
+                .bind(&row.model_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("row exists");
+        assert_eq!(fname.as_deref(), Some("model-q4.gguf"));
+        assert_eq!(mmproj.as_deref(), Some("mmproj-foo-f16.gguf"));
+    }
+
+    #[tokio::test]
+    async fn insert_downloaded_model_leaves_mmproj_null_for_text_only() {
+        // No mmproj → column persists as NULL (text-only model path).
+        let db = crate::db::Database::test_db().await;
+
+        let row = DownloadedModelRow {
+            model_id: "text-only-model".to_string(),
+            hf_repo: "owner/text-repo".to_string(),
+            primary_filename: Some("model-q4.gguf".to_string()),
+            mmproj_filename: None,
+            size_bytes: 1_000,
+            category_id: None,
+            backend_type: "llamacpp".to_string(),
+            model_metadata: None,
+            gguf_meta: GgufMetadata::default(),
+            kv_bpt_global: None,
+            kv_bpt_swa: None,
+            runtime_overrides_json: "{}".to_string(),
+        };
+
+        insert_downloaded_model(&db.pool, &row)
+            .await
+            .expect("insert succeeds");
+
+        let (mmproj,): (Option<String>,) =
+            sqlx::query_as("SELECT mmproj_filename FROM models WHERE id = ?")
+                .bind(&row.model_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("row exists");
+        assert_eq!(mmproj, None);
     }
 }

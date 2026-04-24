@@ -530,10 +530,7 @@ async fn list_downloadable_files(
             if skip_files.iter().any(|s| f.path.starts_with(s)) {
                 return false;
             }
-            if let Some(ref filter) = file_filter {
-                return filter.iter().any(|p| p == &f.path);
-            }
-            true
+            should_include(&f.path, file_filter.as_deref())
         })
         .collect();
 
@@ -846,6 +843,77 @@ fn detect_primary_file(downloadable: &[HfFileEntry]) -> Option<String> {
         .map(|(path, _)| path.to_string())
 }
 
+/// True iff `path` names a companion multimodal-projector GGUF sitting at the
+/// repository root. Accepts both `mmproj-*.gguf` and `mmproj_*.gguf`; rejects
+/// anything nested under a subdirectory (repo-root only).
+fn is_mmproj_filename(path: &str) -> bool {
+    if path.contains('/') {
+        return false;
+    }
+    (path.starts_with("mmproj-") || path.starts_with("mmproj_")) && path.ends_with(".gguf")
+}
+
+/// Pure filter decision for [`list_downloadable_files`].
+///
+/// - If `filter` is `None`, every non-skip file passes.
+/// - If `filter` is `Some(list)`, only paths in `list` pass — **except** that
+///   mmproj sibling files are always included when present (7b: user intent
+///   for this card is "grab the mmproj if it's there").
+fn should_include(path: &str, filter: Option<&[String]>) -> bool {
+    if is_mmproj_filename(path) {
+        return true;
+    }
+    match filter {
+        None => true,
+        Some(list) => list.iter().any(|p| p == path),
+    }
+}
+
+/// Detect the companion mmproj (multimodal projector) GGUF from a list of
+/// downloadable files. Returns `None` if none are present.
+///
+/// When multiple mmproj candidates exist, prefers `f16 > bf16 > f32` with a
+/// lexical fallback. The `f16` probe is guarded against matching `bf16` —
+/// same safety rule as [`crate::pick_mmproj_variant`] in the startup backfill.
+///
+/// Logs at `info!` when multiple candidates are present so operators can see
+/// which variant was picked and which were skipped.
+fn detect_mmproj_file(entries: &[HfFileEntry]) -> Option<String> {
+    let mut candidates: Vec<&str> = entries
+        .iter()
+        .filter(|f| is_mmproj_filename(&f.path))
+        .map(|f| f.path.as_str())
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    candidates.sort();
+
+    let picked = if let Some(&n) = candidates
+        .iter()
+        .find(|n| n.contains("f16") && !n.contains("bf16"))
+    {
+        n
+    } else if let Some(&n) = candidates.iter().find(|n| n.contains("bf16")) {
+        n
+    } else if let Some(&n) = candidates.iter().find(|n| n.contains("f32")) {
+        n
+    } else {
+        candidates[0]
+    };
+
+    if candidates.len() > 1 {
+        let skipped: Vec<&&str> = candidates.iter().filter(|c| **c != picked).collect();
+        info!(
+            picked = %picked,
+            skipped = ?skipped,
+            "mmproj download: multiple candidates, picked preferred variant"
+        );
+    }
+
+    Some(picked.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Background download task — orchestrator
 // ---------------------------------------------------------------------------
@@ -948,8 +1016,12 @@ async fn run_download(
         meta.unwrap_or_default()
     };
 
-    // Step 10: Detect the primary model file
+    // Step 10: Detect the primary model file and companion mmproj sibling
     let primary_filename = detect_primary_file(&downloadable);
+    let mmproj_filename = detect_mmproj_file(&downloadable);
+    if let Some(ref m) = mmproj_filename {
+        info!(hf_repo = %hf_repo, mmproj = %m, "Detected companion mmproj file");
+    }
 
     // Auto-mitigation for llama.cpp #21762: SWA-bearing dense models can crash
     // in the prompt-cache save path. Disable the cache by default for those.
@@ -2274,5 +2346,129 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(auto_runtime_overrides(&meta), "{}");
+    }
+
+    // -- is_mmproj_filename --------------------------------------------------
+
+    #[test]
+    fn is_mmproj_filename_accepts_dash_prefix() {
+        assert!(is_mmproj_filename("mmproj-foo-f16.gguf"));
+    }
+
+    #[test]
+    fn is_mmproj_filename_accepts_underscore_prefix() {
+        assert!(is_mmproj_filename("mmproj_foo_f16.gguf"));
+    }
+
+    #[test]
+    fn is_mmproj_filename_rejects_non_gguf() {
+        assert!(!is_mmproj_filename("mmproj-foo.bin"));
+    }
+
+    #[test]
+    fn is_mmproj_filename_rejects_non_prefix() {
+        assert!(!is_mmproj_filename("foo-mmproj.gguf"));
+    }
+
+    #[test]
+    fn is_mmproj_filename_rejects_non_root_path() {
+        assert!(!is_mmproj_filename("subdir/mmproj-foo.gguf"));
+    }
+
+    // -- detect_mmproj_file --------------------------------------------------
+
+    #[test]
+    fn detect_mmproj_file_none_when_absent() {
+        let files = vec![make_file("model.gguf", 1_000)];
+        assert_eq!(detect_mmproj_file(&files), None);
+    }
+
+    #[test]
+    fn detect_mmproj_file_single_match() {
+        let files = vec![
+            make_file("model.gguf", 1_000),
+            make_file("mmproj-foo-f16.gguf", 500),
+        ];
+        assert_eq!(
+            detect_mmproj_file(&files),
+            Some("mmproj-foo-f16.gguf".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_mmproj_file_prefers_f16_over_bf16_and_f32() {
+        let files = vec![
+            make_file("model.gguf", 1_000),
+            make_file("mmproj-foo-bf16.gguf", 400),
+            make_file("mmproj-foo-f32.gguf", 600),
+            make_file("mmproj-foo-f16.gguf", 500),
+        ];
+        assert_eq!(
+            detect_mmproj_file(&files),
+            Some("mmproj-foo-f16.gguf".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_mmproj_file_prefers_bf16_over_f32() {
+        let files = vec![
+            make_file("model.gguf", 1_000),
+            make_file("mmproj-foo-f32.gguf", 600),
+            make_file("mmproj-foo-bf16.gguf", 400),
+        ];
+        assert_eq!(
+            detect_mmproj_file(&files),
+            Some("mmproj-foo-bf16.gguf".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_mmproj_file_f16_not_confused_by_bf16() {
+        // Only bf16 present — must pick the bf16 entry, NOT misclassify it as f16.
+        let files = vec![make_file("mmproj-foo-bf16.gguf", 400)];
+        assert_eq!(
+            detect_mmproj_file(&files),
+            Some("mmproj-foo-bf16.gguf".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_mmproj_file_ignores_subdir_matches() {
+        let files = vec![
+            make_file("model.gguf", 1_000),
+            make_file("subdir/mmproj-x.gguf", 500),
+        ];
+        // mmproj under a subdir must not be picked.
+        assert_eq!(detect_mmproj_file(&files), None);
+    }
+
+    // -- should_include (filter helper) --------------------------------------
+
+    #[test]
+    fn should_include_explicit_filter_accepts_listed_file() {
+        let filter = vec!["main.gguf".to_string()];
+        assert!(should_include("main.gguf", Some(&filter)));
+    }
+
+    #[test]
+    fn should_include_explicit_filter_always_includes_mmproj() {
+        let filter = vec!["main.gguf".to_string()];
+        assert!(should_include("mmproj-foo-f16.gguf", Some(&filter)));
+    }
+
+    #[test]
+    fn should_include_explicit_filter_rejects_unlisted_non_mmproj() {
+        let filter = vec!["main.gguf".to_string()];
+        assert!(!should_include("extra.gguf", Some(&filter)));
+    }
+
+    #[test]
+    fn should_include_no_filter_accepts_any_file() {
+        assert!(should_include("main.gguf", None));
+    }
+
+    #[test]
+    fn should_include_no_filter_accepts_mmproj() {
+        assert!(should_include("mmproj-foo-f16.gguf", None));
     }
 }

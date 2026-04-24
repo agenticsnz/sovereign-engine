@@ -90,7 +90,7 @@ impl Default for LlamacppConfig {
 /// optional assets (e.g. mmproj).
 pub(crate) fn build_llamacpp_cmd(
     config: &LlamacppConfig,
-    _host_model_path: &str,
+    host_model_path: &str,
     internal_port: u16,
 ) -> Vec<String> {
     let mut cmd = vec![
@@ -115,6 +115,25 @@ pub(crate) fn build_llamacpp_cmd(
     // Add API key for backend authentication
     cmd.push("--api-key".to_string());
     cmd.push(config.api_key.clone());
+
+    // Multimodal projector: only emit when the file actually exists on
+    // disk under the host model path. This runs BEFORE extra_args so a
+    // user-supplied runtime_override cannot override the proxy's choice.
+    // If the column is set but the file is missing, warn and continue —
+    // text still works, images will 500, operator fixes forward.
+    if let Some(rel) = &config.mmproj_path {
+        let host_full = std::path::Path::new(host_model_path).join(rel);
+        if host_full.exists() {
+            cmd.push("--mmproj".to_string());
+            cmd.push(format!("/models/{rel}"));
+        } else {
+            warn!(
+                model = %config.model_id,
+                expected = %host_full.display(),
+                "mmproj_path set but file not found on disk; starting without --mmproj (text-only)"
+            );
+        }
+    }
 
     cmd.extend(config.extra_args.clone());
     cmd
@@ -389,6 +408,141 @@ fn gpu_device_gids() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    /// Helper: construct a minimal viable config with the given mmproj_path.
+    fn config_with_mmproj(mmproj_path: Option<String>) -> LlamacppConfig {
+        LlamacppConfig {
+            model_id: "test-model".to_string(),
+            gguf_path: "repo--x/model.gguf".to_string(),
+            api_key: "test-key".to_string(),
+            mmproj_path,
+            ..Default::default()
+        }
+    }
+
+    // -- build_llamacpp_cmd: mmproj handling ---------------------------------
+
+    #[test]
+    fn build_cmd_omits_mmproj_when_none() {
+        let cfg = config_with_mmproj(None);
+        let cmd = build_llamacpp_cmd(&cfg, "/tmp/does-not-matter", 8080);
+        assert!(
+            !cmd.iter().any(|a| a == "--mmproj"),
+            "cmd should not contain --mmproj when mmproj_path is None: {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn build_cmd_emits_mmproj_when_file_exists() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo_dir = tmp.path().join("repo--x");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        std::fs::write(repo_dir.join("mmproj-foo.gguf"), b"stub").expect("write");
+
+        let cfg = config_with_mmproj(Some("repo--x/mmproj-foo.gguf".to_string()));
+        let cmd = build_llamacpp_cmd(&cfg, tmp.path().to_str().unwrap(), 8080);
+
+        let idx = cmd
+            .iter()
+            .position(|a| a == "--mmproj")
+            .expect("cmd should contain --mmproj");
+        assert_eq!(
+            cmd.get(idx + 1).map(String::as_str),
+            Some("/models/repo--x/mmproj-foo.gguf"),
+            "arg after --mmproj should be container path: {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn build_cmd_omits_mmproj_when_file_missing() {
+        // Same config shape as _emits_ test, but the file is not on disk.
+        let tmp = TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("repo--x")).expect("mkdir");
+        // NOTE: mmproj-foo.gguf deliberately NOT created.
+
+        let cfg = config_with_mmproj(Some("repo--x/mmproj-foo.gguf".to_string()));
+        let cmd = build_llamacpp_cmd(&cfg, tmp.path().to_str().unwrap(), 8080);
+
+        assert!(
+            !cmd.iter().any(|a| a == "--mmproj"),
+            "cmd should not contain --mmproj when file is missing: {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn build_cmd_mmproj_precedes_extra_args() {
+        // The proxy owns --mmproj; a user-supplied extra_args entry with the
+        // same flag must not win. The proxy-emitted flag appears FIRST.
+        let tmp = TempDir::new().expect("tempdir");
+        let repo_dir = tmp.path().join("repo--x");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        std::fs::write(repo_dir.join("mmproj-foo.gguf"), b"stub").expect("write");
+
+        let mut cfg = config_with_mmproj(Some("repo--x/mmproj-foo.gguf".to_string()));
+        cfg.extra_args = vec!["--mmproj".to_string(), "/evil.gguf".to_string()];
+
+        let cmd = build_llamacpp_cmd(&cfg, tmp.path().to_str().unwrap(), 8080);
+
+        let indices: Vec<usize> = cmd
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| if a == "--mmproj" { Some(i) } else { None })
+            .collect();
+        assert_eq!(
+            indices.len(),
+            2,
+            "expected two --mmproj entries (proxy + user): {cmd:?}"
+        );
+
+        let first = indices[0];
+        assert_eq!(
+            cmd.get(first + 1).map(String::as_str),
+            Some("/models/repo--x/mmproj-foo.gguf"),
+            "proxy's --mmproj must come first: {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn build_cmd_mmproj_uses_container_path_prefix() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo_dir = tmp.path().join("repo--x");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        std::fs::write(repo_dir.join("mmproj-foo.gguf"), b"stub").expect("write");
+
+        let cfg = config_with_mmproj(Some("repo--x/mmproj-foo.gguf".to_string()));
+        let cmd = build_llamacpp_cmd(&cfg, tmp.path().to_str().unwrap(), 8080);
+
+        let idx = cmd.iter().position(|a| a == "--mmproj").expect("--mmproj");
+        let path_arg = cmd.get(idx + 1).expect("arg after --mmproj");
+        assert!(
+            path_arg.starts_with("/models/"),
+            "container path must start with /models/, got: {path_arg}"
+        );
+        let host_prefix = tmp.path().to_str().unwrap();
+        assert!(
+            !path_arg.contains(host_prefix),
+            "container path must not leak host prefix {host_prefix}: {path_arg}"
+        );
+    }
+
+    #[test]
+    fn build_cmd_mmproj_correct_position_relative_to_context_size() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo_dir = tmp.path().join("repo--x");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        std::fs::write(repo_dir.join("mmproj-foo.gguf"), b"stub").expect("write");
+
+        let cfg = config_with_mmproj(Some("repo--x/mmproj-foo.gguf".to_string()));
+        let cmd = build_llamacpp_cmd(&cfg, tmp.path().to_str().unwrap(), 8080);
+
+        let c_idx = cmd.iter().position(|a| a == "-c").expect("-c present");
+        let mmproj_idx = cmd.iter().position(|a| a == "--mmproj").expect("--mmproj");
+        assert!(
+            mmproj_idx > c_idx,
+            "--mmproj (idx {mmproj_idx}) should come AFTER -c (idx {c_idx}): {cmd:?}"
+        );
+    }
 
     // -- build_llamacpp_cmd: regression guard on baseline arg order ----------
 

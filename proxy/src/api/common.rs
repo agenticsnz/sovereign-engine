@@ -65,7 +65,7 @@ pub async fn fetch_all_categories(pool: &SqlitePool) -> impl IntoResponse {
 /// Fetch all registered models. Used by both admin and user list endpoints.
 pub async fn fetch_all_models(pool: &SqlitePool) -> impl IntoResponse {
     match sqlx::query_as::<_, Model>(
-        "SELECT id, hf_repo, filename, size_bytes, category_id, loaded, backend_port, backend_type, last_used_at, created_at, context_length, n_layers, n_heads, n_kv_heads, embedding_length, key_length, value_length, sliding_window, kv_bytes_per_token_global, kv_bytes_per_token_swa, runtime_overrides FROM models",
+        "SELECT id, hf_repo, filename, size_bytes, category_id, loaded, backend_port, backend_type, last_used_at, created_at, context_length, n_layers, n_heads, n_kv_heads, embedding_length, key_length, value_length, sliding_window, kv_bytes_per_token_global, kv_bytes_per_token_swa, mmproj_filename, runtime_overrides FROM models",
     )
     .fetch_all(pool)
     .await

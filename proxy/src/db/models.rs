@@ -46,6 +46,10 @@ pub struct Model {
     pub sliding_window: Option<i64>,
     pub kv_bytes_per_token_global: Option<i64>,
     pub kv_bytes_per_token_swa: Option<i64>,
+    /// Companion mmproj (multimodal projector) GGUF filename — sibling of the
+    /// primary `filename` in the same `hf_repo` directory. `None` for
+    /// text-only models.
+    pub mmproj_filename: Option<String>,
     /// Per-model llama-server CLI overrides. Stored as a JSON TEXT column
     /// (defaults to `{}` per migration). Serialized to the API as a nested
     /// object, not a string — see [`serialize_runtime_overrides`].
@@ -123,6 +127,7 @@ mod tests {
             sliding_window: None,
             kv_bytes_per_token_global: None,
             kv_bytes_per_token_swa: None,
+            mmproj_filename: None,
             runtime_overrides: runtime_overrides.into(),
         }
     }

@@ -211,6 +211,7 @@ pub async fn start_container_core(
             let llamacpp_config = crate::docker::llamacpp::LlamacppConfig {
                 model_id: model_id.clone(),
                 gguf_path,
+                mmproj_path: None,
                 gpu_type: crate::docker::llamacpp::GpuType::from_str(
                     params.gpu_type.as_deref().unwrap_or("none"),
                 ),

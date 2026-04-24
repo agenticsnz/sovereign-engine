@@ -46,6 +46,11 @@ pub struct LlamacppConfig {
     pub model_id: String,
     /// Path to the GGUF file relative to the model directory (e.g. "models--TheBloke--Llama-2-7B-GGUF/llama-2-7b.Q4_K_M.gguf")
     pub gguf_path: String,
+    /// Optional multimodal projector path, relative to the model directory
+    /// (e.g. "repo--x/mmproj-foo.gguf"). When `Some` and the file exists on
+    /// disk under `model_path`, `--mmproj /models/<path>` is emitted BEFORE
+    /// any user-supplied `extra_args` so the proxy's choice wins.
+    pub mmproj_path: Option<String>,
     pub gpu_type: GpuType,
     /// Number of layers to offload to GPU (default 99 = all)
     pub gpu_layers: u32,
@@ -65,6 +70,7 @@ impl Default for LlamacppConfig {
         Self {
             model_id: String::new(),
             gguf_path: String::new(),
+            mmproj_path: None,
             gpu_type: GpuType::None,
             gpu_layers: 99,
             context_size: 4096,
@@ -74,6 +80,44 @@ impl Default for LlamacppConfig {
             api_key: String::new(),
         }
     }
+}
+
+/// Pure helper: build the llama-server CLI argv for a given config.
+///
+/// Extracted so it can be unit-tested without a live Docker daemon.
+/// `host_model_path` is the host-side directory that will be bind-mounted
+/// at `/models` in the container — used for file-existence checks on
+/// optional assets (e.g. mmproj).
+pub(crate) fn build_llamacpp_cmd(
+    config: &LlamacppConfig,
+    _host_model_path: &str,
+    internal_port: u16,
+) -> Vec<String> {
+    let mut cmd = vec![
+        "--model".to_string(),
+        format!("/models/{}", config.gguf_path),
+        "--host".to_string(),
+        "0.0.0.0".to_string(),
+        "--port".to_string(),
+        internal_port.to_string(),
+        "-ngl".to_string(),
+        config.gpu_layers.to_string(),
+        "-c".to_string(),
+        (config.context_size as u64 * config.parallel as u64).to_string(),
+    ];
+
+    // Parallel sequences (concurrency slots)
+    if config.parallel > 1 {
+        cmd.push("-np".to_string());
+        cmd.push(config.parallel.to_string());
+    }
+
+    // Add API key for backend authentication
+    cmd.push("--api-key".to_string());
+    cmd.push(config.api_key.clone());
+
+    cmd.extend(config.extra_args.clone());
+    cmd
 }
 
 impl DockerManager {
@@ -109,31 +153,9 @@ impl DockerManager {
             GpuType::None => LLAMACPP_IMAGE_CPU,
         };
 
-        // Build llama-server command arguments
-        let mut cmd = vec![
-            "--model".to_string(),
-            format!("/models/{}", config.gguf_path),
-            "--host".to_string(),
-            "0.0.0.0".to_string(),
-            "--port".to_string(),
-            LLAMACPP_INTERNAL_PORT.to_string(),
-            "-ngl".to_string(),
-            config.gpu_layers.to_string(),
-            "-c".to_string(),
-            (config.context_size as u64 * config.parallel as u64).to_string(),
-        ];
-
-        // Parallel sequences (concurrency slots)
-        if config.parallel > 1 {
-            cmd.push("-np".to_string());
-            cmd.push(config.parallel.to_string());
-        }
-
-        // Add API key for backend authentication
-        cmd.push("--api-key".to_string());
-        cmd.push(config.api_key.clone());
-
-        cmd.extend(config.extra_args.clone());
+        // Build llama-server command arguments via the pure helper so the
+        // argv construction is unit-testable without a live Docker daemon.
+        let cmd = build_llamacpp_cmd(config, &self.model_path, LLAMACPP_INTERNAL_PORT);
 
         let uid = config.uid;
         let user_str = format!("{}:{}", uid, uid);
@@ -368,6 +390,45 @@ fn gpu_device_gids() -> Vec<String> {
 mod tests {
     use super::*;
 
+    // -- build_llamacpp_cmd: regression guard on baseline arg order ----------
+
+    #[test]
+    fn build_cmd_existing_args_still_present() {
+        // Regression guard: the default baseline args must remain in the
+        // exact pre-refactor order (--model, --host, --port, -ngl, -c).
+        let cfg = LlamacppConfig {
+            model_id: "m".to_string(),
+            gguf_path: "r--r/m.gguf".to_string(),
+            api_key: "k".to_string(),
+            ..Default::default()
+        };
+        let cmd = build_llamacpp_cmd(&cfg, "/tmp/unused", 8080);
+
+        let expected_prefix = vec![
+            "--model".to_string(),
+            "/models/r--r/m.gguf".to_string(),
+            "--host".to_string(),
+            "0.0.0.0".to_string(),
+            "--port".to_string(),
+            "8080".to_string(),
+            "-ngl".to_string(),
+            "99".to_string(),
+            "-c".to_string(),
+            "4096".to_string(),
+        ];
+        assert_eq!(
+            &cmd[..expected_prefix.len()],
+            expected_prefix.as_slice(),
+            "baseline arg order changed: {cmd:?}"
+        );
+        // API key block must still be present.
+        let api_idx = cmd
+            .iter()
+            .position(|a| a == "--api-key")
+            .expect("--api-key present");
+        assert_eq!(cmd.get(api_idx + 1).map(String::as_str), Some("k"));
+    }
+
     // -- GpuType::from_str ---------------------------------------------------
 
     #[test]
@@ -425,6 +486,7 @@ mod tests {
         assert!(cfg.gguf_path.is_empty());
         assert!(cfg.api_key.is_empty());
         assert!(cfg.extra_args.is_empty());
+        assert!(cfg.mmproj_path.is_none());
         assert!(matches!(cfg.gpu_type, GpuType::None));
     }
 

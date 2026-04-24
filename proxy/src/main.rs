@@ -82,6 +82,9 @@ async fn main() -> Result<()> {
     // Backfill GGUF metadata for models missing architecture info
     backfill_gguf_metadata(&db, &config).await;
 
+    // Backfill mmproj (multimodal projector) filename for text-image models
+    backfill_mmproj_filename(&db, &config).await;
+
     // Initialize Docker manager
     let docker = DockerManager::new(&config).await?;
     info!("Docker manager initialized");
@@ -281,6 +284,135 @@ async fn backfill_gguf_metadata(db: &Database, config: &AppConfig) {
             }
         }
     }
+}
+
+/// Startup wrapper: look up the primary models dir from config and delegate
+/// to [`backfill_mmproj_filename_inner`] so the inner function stays
+/// injectable from unit tests.
+async fn backfill_mmproj_filename(db: &Database, config: &AppConfig) {
+    backfill_mmproj_filename_inner(&db.pool, std::path::Path::new(&config.model_path)).await;
+}
+
+/// For every model row with `mmproj_filename IS NULL`, scan the on-disk
+/// `<base_path>/<hf_repo-with-slashes-replaced>/` directory for a file whose
+/// name starts with `mmproj-` or `mmproj_` and ends with `.gguf`. If exactly
+/// one candidate exists, pick it. If multiple exist, prefer `f16` > `bf16` >
+/// `f32`, falling back to the first lexically. Populate the column on
+/// success; leave it NULL when the directory is missing, unreadable, or
+/// has no candidates.
+///
+/// Never aborts — all errors are logged and skipped. Matches the tolerance
+/// of [`backfill_gguf_metadata`].
+async fn backfill_mmproj_filename_inner(pool: &sqlx::SqlitePool, base_path: &std::path::Path) {
+    let rows: Vec<(String, String)> =
+        match sqlx::query_as("SELECT id, hf_repo FROM models WHERE mmproj_filename IS NULL")
+            .fetch_all(pool)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Failed to query models for mmproj backfill: {e}");
+                return;
+            }
+        };
+
+    if rows.is_empty() {
+        return;
+    }
+
+    for (model_id, hf_repo) in &rows {
+        let safe_repo = hf_repo.replace('/', "--");
+        let dir = base_path.join(&safe_repo);
+
+        let read = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(e) => {
+                // Missing / unreadable dir is the common case for models
+                // whose files have not been provisioned yet, or text-only
+                // models hosted elsewhere. Log at `warn!` and carry on —
+                // mirrors backfill_gguf_metadata's tolerance.
+                warn!(
+                    model = %model_id,
+                    dir = %dir.display(),
+                    error = %e,
+                    "mmproj backfill: failed to read model dir; leaving NULL"
+                );
+                continue;
+            }
+        };
+
+        let mut candidates: Vec<String> = Vec::new();
+        for entry in read.flatten() {
+            // Skip subdirectories — only repo-root files count.
+            match entry.file_type() {
+                Ok(ft) if ft.is_file() => {}
+                _ => continue,
+            }
+            let name = match entry.file_name().into_string() {
+                Ok(n) => n,
+                Err(_) => continue, // non-UTF-8 filename → skip
+            };
+            if (name.starts_with("mmproj-") || name.starts_with("mmproj_"))
+                && name.ends_with(".gguf")
+            {
+                candidates.push(name);
+            }
+        }
+
+        if candidates.is_empty() {
+            // Text-only model — no log, as documented.
+            continue;
+        }
+
+        candidates.sort();
+        let picked = pick_mmproj_variant(&candidates);
+
+        if candidates.len() > 1 {
+            let skipped: Vec<&String> = candidates.iter().filter(|c| *c != &picked).collect();
+            info!(
+                model = %model_id,
+                picked = %picked,
+                skipped = ?skipped,
+                "mmproj backfill: multiple candidates, picked preferred variant"
+            );
+        } else {
+            info!(
+                model = %model_id,
+                picked = %picked,
+                "mmproj backfill: single candidate"
+            );
+        }
+
+        if let Err(e) = sqlx::query("UPDATE models SET mmproj_filename = ? WHERE id = ?")
+            .bind(&picked)
+            .bind(model_id)
+            .execute(pool)
+            .await
+        {
+            error!(model = %model_id, error = %e, "Failed to update mmproj_filename");
+        }
+    }
+}
+
+/// From a non-empty, lex-sorted list of mmproj candidate filenames, pick the
+/// preferred variant: `f16` > `bf16` > `f32`, otherwise the first (lex-smallest).
+///
+/// `bf16` is checked as a distinct token — "contains f16 and not bf16" —
+/// so a file named `mmproj-bf16.gguf` is never misclassified as f16.
+fn pick_mmproj_variant(sorted: &[String]) -> String {
+    if let Some(n) = sorted
+        .iter()
+        .find(|n| n.contains("f16") && !n.contains("bf16"))
+    {
+        return n.clone();
+    }
+    if let Some(n) = sorted.iter().find(|n| n.contains("bf16")) {
+        return n.clone();
+    }
+    if let Some(n) = sorted.iter().find(|n| n.contains("f32")) {
+        return n.clone();
+    }
+    sorted[0].clone()
 }
 
 /// Re-register concurrency gates for containers that survived a proxy restart.
@@ -616,5 +748,203 @@ mod csp_tests {
         let html = "<script>var x = 1;";
         let hashes = extract_inline_script_hashes(html);
         assert!(hashes.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod mmproj_backfill_tests {
+    //! Unit tests for [`backfill_mmproj_filename_inner`].
+    //!
+    //! Each test: spin up an in-memory SQLite DB (with all migrations), a
+    //! tempdir to stand in for `config.model_path`, optionally create files
+    //! under `<tempdir>/<hf_repo-safe>/`, insert a `models` row, run the
+    //! backfill, and assert on the resulting `mmproj_filename` value.
+
+    use super::*;
+    use crate::db::Database;
+    use std::fs;
+
+    /// Insert a minimal models row. Caller decides whether `mmproj_filename`
+    /// starts NULL (the usual backfill input) or pre-set.
+    async fn insert_model_row(
+        pool: &sqlx::SqlitePool,
+        id: &str,
+        hf_repo: &str,
+        filename: &str,
+        mmproj: Option<&str>,
+    ) {
+        sqlx::query(
+            "INSERT INTO models (id, hf_repo, filename, backend_type, loaded, mmproj_filename) \
+             VALUES (?, ?, ?, 'llamacpp', 0, ?)",
+        )
+        .bind(id)
+        .bind(hf_repo)
+        .bind(filename)
+        .bind(mmproj)
+        .execute(pool)
+        .await
+        .expect("insert model");
+    }
+
+    async fn get_mmproj(pool: &sqlx::SqlitePool, id: &str) -> Option<String> {
+        let (val,): (Option<String>,) =
+            sqlx::query_as("SELECT mmproj_filename FROM models WHERE id = ?")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("fetch mmproj_filename");
+        val
+    }
+
+    fn repo_dir(root: &std::path::Path, hf_repo: &str) -> std::path::PathBuf {
+        root.join(hf_repo.replace('/', "--"))
+    }
+
+    #[tokio::test]
+    async fn backfill_mmproj_picks_single_match() {
+        let db = Database::test_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo_dir(tmp.path(), "owner/repo");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("model.gguf"), b"").unwrap();
+        fs::write(dir.join("mmproj-owner_repo-f16.gguf"), b"").unwrap();
+
+        insert_model_row(&db.pool, "m1", "owner/repo", "model.gguf", None).await;
+
+        backfill_mmproj_filename_inner(&db.pool, tmp.path()).await;
+
+        assert_eq!(
+            get_mmproj(&db.pool, "m1").await.as_deref(),
+            Some("mmproj-owner_repo-f16.gguf")
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_mmproj_no_match_leaves_null() {
+        let db = Database::test_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo_dir(tmp.path(), "owner/repo");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("model.gguf"), b"").unwrap();
+
+        insert_model_row(&db.pool, "m1", "owner/repo", "model.gguf", None).await;
+
+        backfill_mmproj_filename_inner(&db.pool, tmp.path()).await;
+
+        assert_eq!(get_mmproj(&db.pool, "m1").await, None);
+    }
+
+    #[tokio::test]
+    async fn backfill_mmproj_prefers_f16_over_bf16_and_f32() {
+        let db = Database::test_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo_dir(tmp.path(), "owner/repo");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("mmproj-f16.gguf"), b"").unwrap();
+        fs::write(dir.join("mmproj-bf16.gguf"), b"").unwrap();
+        fs::write(dir.join("mmproj-f32.gguf"), b"").unwrap();
+
+        insert_model_row(&db.pool, "m1", "owner/repo", "model.gguf", None).await;
+
+        backfill_mmproj_filename_inner(&db.pool, tmp.path()).await;
+
+        assert_eq!(
+            get_mmproj(&db.pool, "m1").await.as_deref(),
+            Some("mmproj-f16.gguf")
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_mmproj_prefers_bf16_over_f32() {
+        let db = Database::test_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo_dir(tmp.path(), "owner/repo");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("mmproj-bf16.gguf"), b"").unwrap();
+        fs::write(dir.join("mmproj-f32.gguf"), b"").unwrap();
+
+        insert_model_row(&db.pool, "m1", "owner/repo", "model.gguf", None).await;
+
+        backfill_mmproj_filename_inner(&db.pool, tmp.path()).await;
+
+        assert_eq!(
+            get_mmproj(&db.pool, "m1").await.as_deref(),
+            Some("mmproj-bf16.gguf")
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_mmproj_accepts_underscore_prefix() {
+        let db = Database::test_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo_dir(tmp.path(), "owner/repo");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("mmproj_foo.gguf"), b"").unwrap();
+
+        insert_model_row(&db.pool, "m1", "owner/repo", "model.gguf", None).await;
+
+        backfill_mmproj_filename_inner(&db.pool, tmp.path()).await;
+
+        assert_eq!(
+            get_mmproj(&db.pool, "m1").await.as_deref(),
+            Some("mmproj_foo.gguf")
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_mmproj_ignores_non_root_mmproj() {
+        let db = Database::test_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo_dir(tmp.path(), "owner/repo");
+        let subdir = dir.join("subdir");
+        fs::create_dir_all(&subdir).unwrap();
+        fs::write(subdir.join("mmproj-x.gguf"), b"").unwrap();
+
+        insert_model_row(&db.pool, "m1", "owner/repo", "model.gguf", None).await;
+
+        backfill_mmproj_filename_inner(&db.pool, tmp.path()).await;
+
+        assert_eq!(get_mmproj(&db.pool, "m1").await, None);
+    }
+
+    #[tokio::test]
+    async fn backfill_mmproj_skips_non_null_rows() {
+        let db = Database::test_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo_dir(tmp.path(), "owner/repo");
+        fs::create_dir_all(&dir).unwrap();
+        // A real mmproj file exists on disk — but the DB already has a
+        // preset value, so the backfill must NOT overwrite.
+        fs::write(dir.join("mmproj-f16.gguf"), b"").unwrap();
+
+        insert_model_row(
+            &db.pool,
+            "m1",
+            "owner/repo",
+            "model.gguf",
+            Some("preset.gguf"),
+        )
+        .await;
+
+        backfill_mmproj_filename_inner(&db.pool, tmp.path()).await;
+
+        assert_eq!(
+            get_mmproj(&db.pool, "m1").await.as_deref(),
+            Some("preset.gguf")
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_mmproj_tolerates_missing_directory() {
+        let db = Database::test_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        // Note: do NOT create `tmp.path()/owner--repo/` — the dir is absent.
+
+        insert_model_row(&db.pool, "m1", "owner/repo", "model.gguf", None).await;
+
+        // Must not panic, must not abort.
+        backfill_mmproj_filename_inner(&db.pool, tmp.path()).await;
+
+        assert_eq!(get_mmproj(&db.pool, "m1").await, None);
     }
 }

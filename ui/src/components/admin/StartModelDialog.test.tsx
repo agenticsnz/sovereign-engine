@@ -19,6 +19,7 @@ const baseModel: AdminModel = {
   id: 'model-1',
   hf_repo: 'TheBloke/Llama-7B-GGUF',
   filename: 'llama-7b.Q4_K_M.gguf',
+  mmproj_filename: null,
   size_bytes: 4_000_000_000,
   category_id: null,
   loaded: false,

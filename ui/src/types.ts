@@ -171,6 +171,12 @@ export interface AdminModel {
   id: string;
   hf_repo: string;
   filename: string | null;
+  /**
+   * Filename of the multimodal projector (mmproj) GGUF that pairs with this
+   * model, if any. Non-null means the model was downloaded with a vision
+   * projector and is launched with `--mmproj` by the llama.cpp backend.
+   */
+  mmproj_filename: string | null;
   size_bytes: number;
   category_id: string | null;
   loaded: boolean;

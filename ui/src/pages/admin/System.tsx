@@ -331,7 +331,28 @@ export default function System() {
 
                 return (
                   <tr key={model.id} style={{ borderBottom: `1px solid ${colors.tableRowBorder}` }}>
-                    <td style={{ padding: '0.5rem', wordBreak: 'break-all' }}>{model.hf_repo}</td>
+                    <td style={{ padding: '0.5rem' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', wordBreak: 'break-all' }}>
+                        <span>{model.hf_repo}</span>
+                        {model.mmproj_filename && (
+                          <span
+                            title={`mmproj: ${model.mmproj_filename}`}
+                            style={{
+                              display: 'inline-block',
+                              padding: '0.15rem 0.5rem',
+                              borderRadius: 12,
+                              fontSize: '0.7rem',
+                              fontWeight: 600,
+                              background: colors.badgePurpleBg,
+                              color: colors.badgePurpleText,
+                              whiteSpace: 'nowrap',
+                            }}
+                          >
+                            Vision
+                          </span>
+                        )}
+                      </div>
+                    </td>
                     <td style={{ padding: '0.5rem', textAlign: 'right', whiteSpace: 'nowrap' }}>
                       {formatBytes(model.size_bytes)}
                     </td>

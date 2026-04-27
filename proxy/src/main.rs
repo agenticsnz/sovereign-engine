@@ -397,19 +397,26 @@ async fn backfill_mmproj_filename_inner(pool: &sqlx::SqlitePool, base_path: &std
 /// From a non-empty, lex-sorted list of mmproj candidate filenames, pick the
 /// preferred variant: `f16` > `bf16` > `f32`, otherwise the first (lex-smallest).
 ///
+/// Matching is **case-insensitive** — bartowski ships lowercase
+/// (`mmproj-...-f16.gguf`) but unsloth ships uppercase
+/// (`mmproj-F16.gguf`, `mmproj-BF16.gguf`, `mmproj-F32.gguf`). Without the
+/// `.to_lowercase()` normalisation, all three branches miss for unsloth
+/// repos and we fall through to lex-first, which is `BF16` (because
+/// `'B' < 'F'`) rather than the documented `F16` preference.
+///
 /// `bf16` is checked as a distinct token — "contains f16 and not bf16" —
 /// so a file named `mmproj-bf16.gguf` is never misclassified as f16.
 fn pick_mmproj_variant(sorted: &[String]) -> String {
-    if let Some(n) = sorted
-        .iter()
-        .find(|n| n.contains("f16") && !n.contains("bf16"))
-    {
+    if let Some(n) = sorted.iter().find(|n| {
+        let lc = n.to_lowercase();
+        lc.contains("f16") && !lc.contains("bf16")
+    }) {
         return n.clone();
     }
-    if let Some(n) = sorted.iter().find(|n| n.contains("bf16")) {
+    if let Some(n) = sorted.iter().find(|n| n.to_lowercase().contains("bf16")) {
         return n.clone();
     }
-    if let Some(n) = sorted.iter().find(|n| n.contains("f32")) {
+    if let Some(n) = sorted.iter().find(|n| n.to_lowercase().contains("f32")) {
         return n.clone();
     }
     sorted[0].clone()
@@ -946,5 +953,66 @@ mod mmproj_backfill_tests {
         backfill_mmproj_filename_inner(&db.pool, tmp.path()).await;
 
         assert_eq!(get_mmproj(&db.pool, "m1").await, None);
+    }
+}
+
+#[cfg(test)]
+mod pick_mmproj_variant_tests {
+    //! Unit tests for [`pick_mmproj_variant`].
+    //!
+    //! Mirrors the case-coverage in `proxy/src/api/hf.rs::detect_mmproj_file`
+    //! tests so the two functions stay in lock-step.
+
+    use super::pick_mmproj_variant;
+
+    fn names(items: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = items.iter().map(|s| s.to_string()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn prefers_lowercase_f16_over_bf16_and_f32() {
+        let v = names(&[
+            "mmproj-foo-bf16.gguf",
+            "mmproj-foo-f16.gguf",
+            "mmproj-foo-f32.gguf",
+        ]);
+        assert_eq!(pick_mmproj_variant(&v), "mmproj-foo-f16.gguf");
+    }
+
+    #[test]
+    fn lowercase_bf16_not_misclassified_as_f16() {
+        let v = names(&["mmproj-foo-bf16.gguf"]);
+        assert_eq!(pick_mmproj_variant(&v), "mmproj-foo-bf16.gguf");
+    }
+
+    #[test]
+    fn prefers_uppercase_f16_over_bf16_and_f32() {
+        // unsloth-style UPPERCASE quant tags (e.g. unsloth/Qwen3.6-A3B-GGUF).
+        // Without case-insensitive matching, all three branches miss and we
+        // fall through to lex-first → BF16 (because 'B' < 'F').
+        let v = names(&["mmproj-BF16.gguf", "mmproj-F16.gguf", "mmproj-F32.gguf"]);
+        assert_eq!(pick_mmproj_variant(&v), "mmproj-F16.gguf");
+    }
+
+    #[test]
+    fn prefers_uppercase_bf16_over_f32() {
+        let v = names(&["mmproj-BF16.gguf", "mmproj-F32.gguf"]);
+        assert_eq!(pick_mmproj_variant(&v), "mmproj-BF16.gguf");
+    }
+
+    #[test]
+    fn uppercase_bf16_not_confused_by_f16() {
+        // Only BF16 present, uppercase — must pick the BF16 entry, NOT
+        // misclassify it as F16 once we lowercase the haystack.
+        let v = names(&["mmproj-BF16.gguf"]);
+        assert_eq!(pick_mmproj_variant(&v), "mmproj-BF16.gguf");
+    }
+
+    #[test]
+    fn mixed_case_quant_tag_resolves() {
+        let v = names(&["mmproj-Bf16.gguf", "mmproj-f16.gguf"]);
+        assert_eq!(pick_mmproj_variant(&v), "mmproj-f16.gguf");
     }
 }

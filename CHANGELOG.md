@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.1] - 2026-04-27
+
+### Fixed
+- llama-server is now launched with `--jinja`, activating the full Jinja2 chat-template path. Without it, modern model-native tool-call markup (qwen Hermes-style, gemma `<|tool_call>...`, mistral `[TOOL_CALLS]`, ...) leaked into `choices[0].message.content` instead of being parsed back into structured OpenAI `tool_calls` JSON — silently breaking every OpenAI-SDK consumer that relied on tool-calling against a Sovereign-served model.
+- mmproj variant picker (`pick_mmproj_variant` in `proxy/src/main.rs` and `detect_mmproj_file` in `proxy/src/api/hf.rs`) is now case-insensitive. Bartowski ships lowercase quant tags (`mmproj-...-f16.gguf`) but unsloth ships uppercase (`mmproj-F16.gguf`, `mmproj-BF16.gguf`, `mmproj-F32.gguf`). With case-sensitive matching, all three preference branches missed for unsloth repos and the lex-first fallback picked `BF16` (because `'B' < 'F'`) rather than the documented `F16` preference. Functionally close (BF16 ≈ F16) but wrong per the documented contract.
+
 ## [1.6.0] - 2026-04-24
 
 ### Added

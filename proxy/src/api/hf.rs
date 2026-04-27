@@ -889,14 +889,22 @@ fn detect_mmproj_file(entries: &[HfFileEntry]) -> Option<String> {
     }
     candidates.sort();
 
-    let picked = if let Some(&n) = candidates
+    // Case-insensitive matching — bartowski ships lowercase (`...-f16.gguf`)
+    // but unsloth ships uppercase (`mmproj-F16.gguf`). Without `.to_lowercase()`
+    // all branches miss for unsloth repos and we fall through to lex-first
+    // (`BF16` because `'B' < 'F'`) rather than the documented `F16` preference.
+    // Same safety rule as [`crate::pick_mmproj_variant`].
+    let picked = if let Some(&n) = candidates.iter().find(|n| {
+        let lc = n.to_lowercase();
+        lc.contains("f16") && !lc.contains("bf16")
+    }) {
+        n
+    } else if let Some(&n) = candidates
         .iter()
-        .find(|n| n.contains("f16") && !n.contains("bf16"))
+        .find(|n| n.to_lowercase().contains("bf16"))
     {
         n
-    } else if let Some(&n) = candidates.iter().find(|n| n.contains("bf16")) {
-        n
-    } else if let Some(&n) = candidates.iter().find(|n| n.contains("f32")) {
+    } else if let Some(&n) = candidates.iter().find(|n| n.to_lowercase().contains("f32")) {
         n
     } else {
         candidates[0]
@@ -2486,6 +2494,63 @@ mod tests {
         ];
         // mmproj under a subdir must not be picked.
         assert_eq!(detect_mmproj_file(&files), None);
+    }
+
+    // -- case-insensitive matching (unsloth ships UPPERCASE quant tags) ------
+
+    #[test]
+    fn detect_mmproj_file_prefers_uppercase_f16_over_bf16_and_f32() {
+        // Mirror of the lowercase preference test, but using unsloth-style
+        // UPPERCASE quant tags (e.g. unsloth/Qwen3.6-A3B-GGUF). The picker
+        // must lowercase before matching, otherwise all three branches miss
+        // and we fall through to lex-first → BF16 (because 'B' < 'F').
+        let files = vec![
+            make_file("model.gguf", 1_000),
+            make_file("mmproj-BF16.gguf", 400),
+            make_file("mmproj-F32.gguf", 600),
+            make_file("mmproj-F16.gguf", 500),
+        ];
+        assert_eq!(
+            detect_mmproj_file(&files),
+            Some("mmproj-F16.gguf".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_mmproj_file_prefers_uppercase_bf16_over_f32() {
+        let files = vec![
+            make_file("model.gguf", 1_000),
+            make_file("mmproj-F32.gguf", 600),
+            make_file("mmproj-BF16.gguf", 400),
+        ];
+        assert_eq!(
+            detect_mmproj_file(&files),
+            Some("mmproj-BF16.gguf".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_mmproj_file_uppercase_f16_not_confused_by_bf16() {
+        // Only BF16 present, uppercase — must pick the BF16 entry, NOT
+        // misclassify it as F16 once we lowercase the haystack.
+        let files = vec![make_file("mmproj-BF16.gguf", 400)];
+        assert_eq!(
+            detect_mmproj_file(&files),
+            Some("mmproj-BF16.gguf".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_mmproj_file_mixed_case_quant_tag() {
+        // Defensive: a hypothetical mixed-case tag must still resolve.
+        let files = vec![
+            make_file("mmproj-Bf16.gguf", 400),
+            make_file("mmproj-f16.gguf", 500),
+        ];
+        assert_eq!(
+            detect_mmproj_file(&files),
+            Some("mmproj-f16.gguf".to_string())
+        );
     }
 
     // -- should_include (filter helper) --------------------------------------

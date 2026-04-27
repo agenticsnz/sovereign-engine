@@ -104,6 +104,13 @@ pub(crate) fn build_llamacpp_cmd(
         config.gpu_layers.to_string(),
         "-c".to_string(),
         (config.context_size as u64 * config.parallel as u64).to_string(),
+        // --jinja activates llama-server's full Jinja2 chat-template path,
+        // which parses model-native tool-call markup (qwen Hermes-style,
+        // gemma `<|tool_call>...`, mistral `[TOOL_CALLS]`, ...) back into
+        // structured OpenAI `tool_calls` JSON. Without this the markup
+        // leaks into `choices[0].message.content` and any OpenAI-SDK
+        // consumer sees the model's tool call as plain text.
+        "--jinja".to_string(),
     ];
 
     // Parallel sequences (concurrency slots)
@@ -541,6 +548,30 @@ mod tests {
         assert!(
             mmproj_idx > c_idx,
             "--mmproj (idx {mmproj_idx}) should come AFTER -c (idx {c_idx}): {cmd:?}"
+        );
+    }
+
+    // -- build_llamacpp_cmd: --jinja for OpenAI tool_calls translation ------
+
+    #[test]
+    fn build_cmd_includes_jinja_by_default() {
+        // Without --jinja, llama-server uses a minimal built-in chat-template
+        // parser that doesn't recognise modern model-native tool-call markup
+        // (qwen Hermes-style, gemma `<|tool_call>...`, mistral `[TOOL_CALLS]`).
+        // The markup leaks into `content` instead of being parsed back into
+        // structured `tool_calls` JSON. --jinja activates the full Jinja2
+        // template path which handles all of these.
+        let cfg = LlamacppConfig {
+            model_id: "m".to_string(),
+            gguf_path: "r--r/m.gguf".to_string(),
+            api_key: "k".to_string(),
+            ..Default::default()
+        };
+        let cmd = build_llamacpp_cmd(&cfg, "/tmp/unused", 8080);
+        assert!(
+            cmd.iter().any(|a| a == "--jinja"),
+            "--jinja flag must be present so model-native tool-call markup \
+             is translated back into OpenAI tool_calls JSON; got: {cmd:?}"
         );
     }
 

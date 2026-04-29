@@ -534,7 +534,7 @@ async fn recover_gate_state(state: &Arc<AppState>) -> Vec<String> {
     alive_ids
 }
 
-fn build_router(state: Arc<AppState>) -> Router {
+pub(crate) fn build_router(state: Arc<AppState>) -> Router {
     // Two CORS layers: a strict one (with credentials) for cookie-bearing routes,
     // and a permissive bearer-only layer (no credentials) for /v1/*. Bearer routes
     // are CSRF-immune because browsers do not auto-attach Authorization/x-api-key,
@@ -583,11 +583,9 @@ fn build_router(state: Arc<AppState>) -> Router {
     // Every request reaching portal_routes falls through to ServeDir, which
     // serves files from ui_path with index.html as the SPA fallback.
     let portal_routes = Router::new()
-        .fallback_service(
-            tower_http::services::ServeDir::new(&ui_path).fallback(
-                tower_http::services::ServeFile::new(format!("{}/index.html", ui_path)),
-            ),
-        )
+        .fallback_service(tower_http::services::ServeDir::new(&ui_path).fallback(
+            tower_http::services::ServeFile::new(format!("{}/index.html", ui_path)),
+        ))
         .layer(strict_cors.clone());
 
     // Open WebUI reverse proxy (session auth with redirect for browsers) — strict CORS.

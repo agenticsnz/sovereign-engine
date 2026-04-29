@@ -60,7 +60,7 @@ use crate::docker::DockerManager;
 use crate::metrics::MetricsBroadcaster;
 use crate::scheduler::reservation::ReservationBroadcaster;
 use crate::scheduler::Scheduler;
-use crate::{build_bearer_cors_layer, build_strict_cors_layer, AppState};
+use crate::{build_bearer_cors_layer, build_router, build_strict_cors_layer, AppState};
 
 // ---------------------------------------------------------------------------
 // Test scaffolding
@@ -553,4 +553,59 @@ async fn isolation_api_no_wildcard() {
         allow_origin.is_none(),
         "strict-only /api/* must not emit allow-origin for random origin; got {allow_origin:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// build_router smoke tests
+//
+// These tests exercise `build_router` end-to-end and assert that it returns
+// without panicking. They guard against router-construction bugs that the
+// per-sub-router tests above can never catch — e.g. axum's
+// "Nesting at the root is no longer supported" panic that shipped in 1.8.0
+// because portal_routes used `nest_service("/", ServeDir...)` instead of
+// `fallback_service(ServeDir...)`. Both branches of build_router (dev mode
+// and subdomain mode) must be covered.
+// ---------------------------------------------------------------------------
+
+/// Subdomain mode: `api_hostname != chat_hostname` triggers the Host-dispatching
+/// branch of `build_router`. `test_app_state()` uses this configuration by default
+/// (`api.test.local` / `chat.test.local`).
+#[tokio::test]
+async fn build_router_constructs_in_subdomain_mode() {
+    let state = test_app_state().await;
+    assert_ne!(
+        state.config.api_hostname, state.config.chat_hostname,
+        "test_app_state should produce subdomain mode by default"
+    );
+    let _router = build_router(state);
+    // Pass: build_router returned without panicking.
+}
+
+/// Dev mode: `api_hostname == chat_hostname` triggers the combined-router branch
+/// of `build_router`. This is the path used when running against a single
+/// hostname (e.g. local docker-compose without subdomain DNS).
+#[tokio::test]
+async fn build_router_constructs_in_dev_mode() {
+    let db = Database::test_db().await;
+    let (probe_tx, _probe_rx) = crate::supervisor::channel();
+    let mut config = test_config();
+    config.api_hostname = "localhost".to_string();
+    config.chat_hostname = "localhost".to_string();
+    let state = Arc::new(AppState {
+        config,
+        db,
+        docker: DockerManager::test_dummy(),
+        scheduler: Scheduler::new(),
+        metrics: MetricsBroadcaster::new(),
+        reservations: ReservationBroadcaster::new(),
+        supervisor_map: std::sync::Arc::new(dashmap::DashMap::new()),
+        probe_tx,
+        worked_map: std::sync::Arc::new(dashmap::DashMap::new()),
+    });
+    assert_eq!(
+        state.config.api_hostname, state.config.chat_hostname,
+        "this test must exercise the dev-mode branch"
+    );
+    let _router = build_router(state);
+    // Pass: build_router returned without panicking.
 }

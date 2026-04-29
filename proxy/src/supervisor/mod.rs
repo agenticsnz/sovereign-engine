@@ -80,6 +80,14 @@ pub struct BackendState {
     /// When the supervisor first observed this backend (or its current start).
     /// Used to enforce the 5-minute startup grace.
     pub started_at: Instant,
+    /// If `Some(deadline)` and `deadline > Instant::now()`, [`handle_kick`]
+    /// returns early without probing or transitioning. Set by manual-restart
+    /// paths (`start_container_core`) so the supervisor doesn't classify
+    /// the brief container-replacement window as a crash. Cleared when the
+    /// entry is replaced via [`arm_supervision_starting`] on Ok of
+    /// `start_llamacpp`. The pause expires naturally on Err so the next
+    /// tick reconciles via the existing FSM path.
+    pub pause_until: Option<Instant>,
 }
 
 /// Per-`AppState` map of model_id → BackendState.
@@ -175,6 +183,7 @@ pub fn transition(prev: &BackendState, outcome: ProbeOutcome) -> BackendState {
             fsm: BackendFsmState::Crashed,
             consecutive_failures: prev.consecutive_failures.saturating_add(1),
             started_at: prev.started_at,
+            pause_until: prev.pause_until,
         };
     }
 
@@ -184,6 +193,7 @@ pub fn transition(prev: &BackendState, outcome: ProbeOutcome) -> BackendState {
             fsm: BackendFsmState::Healthy,
             consecutive_failures: 0,
             started_at: prev.started_at,
+            pause_until: prev.pause_until,
         };
     }
 
@@ -199,6 +209,7 @@ pub fn transition(prev: &BackendState, outcome: ProbeOutcome) -> BackendState {
             fsm: BackendFsmState::Starting,
             consecutive_failures: 0,
             started_at: prev.started_at,
+            pause_until: prev.pause_until,
         };
     }
 
@@ -210,6 +221,7 @@ pub fn transition(prev: &BackendState, outcome: ProbeOutcome) -> BackendState {
             fsm: BackendFsmState::Starting,
             consecutive_failures: prev.consecutive_failures.saturating_add(1),
             started_at: prev.started_at,
+            pause_until: prev.pause_until,
         };
     }
 
@@ -227,6 +239,7 @@ pub fn transition(prev: &BackendState, outcome: ProbeOutcome) -> BackendState {
         fsm: new_state,
         consecutive_failures: new_failures,
         started_at: prev.started_at,
+        pause_until: prev.pause_until,
     }
 }
 
@@ -301,7 +314,8 @@ pub fn channel() -> (mpsc::Sender<ProbeKick>, mpsc::Receiver<ProbeKick>) {
 /// `seed_model_ids` are models that `recover_gate_state` confirmed alive at
 /// proxy startup — they're seeded as `Healthy` with `consecutive_failures = 0`
 /// and `started_at = now`. Newly-loaded models register themselves into the
-/// map via [`register_starting`] when their container is launched.
+/// map via [`arm_supervision_starting`] when their container is launched
+/// (called from `start_container_core`'s success branch).
 ///
 /// The caller supplies the `(tx, rx)` pair from [`channel`] so `tx` can be
 /// stored on `AppState` before this function is called.
@@ -319,6 +333,7 @@ pub fn spawn(
                 fsm: BackendFsmState::Healthy,
                 consecutive_failures: 0,
                 started_at: now,
+                pause_until: None,
             },
         );
     }
@@ -328,18 +343,33 @@ pub fn spawn(
     tokio::spawn(supervisor_loop(state, rx, tick_tx));
 }
 
-/// Register a fresh `Starting` entry — used by Phase 6 (and tests) when a
-/// new container is launched. Phase 3 doesn't call this from the launch
-/// path; the seed list at startup plus the kick channel cover all detection
-/// paths for now.
-#[allow(dead_code)]
-pub fn register_starting(map: &SupervisorMap, model_id: &str) {
+/// Pause supervision for `model_id` for the given duration. Inserts a
+/// `Starting` entry if the model isn't tracked yet. Used by manual-restart
+/// paths (`start_container_core`) so the supervisor doesn't classify the
+/// brief container-replacement window as a crash.
+pub fn pause_supervision(map: &SupervisorMap, model_id: &str, duration: Duration) {
+    let until = Instant::now() + duration;
+    map.entry(model_id.to_string())
+        .and_modify(|s| s.pause_until = Some(until))
+        .or_insert_with(|| BackendState {
+            fsm: BackendFsmState::Starting,
+            consecutive_failures: 0,
+            started_at: Instant::now(),
+            pause_until: Some(until),
+        });
+}
+
+/// Replace the supervisor_map entry with a fresh `Starting` state, clearing
+/// any pause. Called from `start_container_core`'s success branch so
+/// supervision is re-armed against the freshly-launched container.
+pub fn arm_supervision_starting(map: &SupervisorMap, model_id: &str) {
     map.insert(
         model_id.to_string(),
         BackendState {
             fsm: BackendFsmState::Starting,
             consecutive_failures: 0,
             started_at: Instant::now(),
+            pause_until: None,
         },
     );
 }
@@ -389,18 +419,38 @@ async fn supervisor_loop(
 
 /// Process a single kick: probe the model and apply the FSM transition.
 async fn handle_kick(state: &Arc<crate::AppState>, client: &reqwest::Client, kick: ProbeKick) {
-    // Look up the prior state. If the model isn't tracked yet we add it as
-    // Starting on first observation — covers the "OnFailure kick before
-    // tick has seen this model" race.
-    let prev = state
-        .supervisor_map
-        .get(&kick.model_id)
-        .map(|e| e.clone())
-        .unwrap_or_else(|| BackendState {
-            fsm: BackendFsmState::Starting,
-            consecutive_failures: 0,
-            started_at: Instant::now(),
-        });
+    // Look up the prior state. The supervisor only tracks models that have
+    // been explicitly seeded — by `recover_gate_state` at startup, by
+    // `start_container_core` on a successful launch, or by
+    // `restart_after_crash`. An absent entry means the model is either
+    // never-started or deliberately stopped (`post_stop_cleanup` removes
+    // it), so we must NOT probe it: a transient missing-container during
+    // a Stop→Start window otherwise looked like a crash and produced a
+    // phantom `backend_crash_log` row plus quarantine.
+    let prev = match state.supervisor_map.get(&kick.model_id) {
+        Some(e) => e.clone(),
+        None => {
+            debug!(
+                model = %kick.model_id,
+                reason = ?kick.reason,
+                "Supervisor skip — model not tracked",
+            );
+            return;
+        }
+    };
+
+    // Honour an active pause set by manual-restart paths so the brief
+    // container-replacement window isn't classified as a crash.
+    if let Some(until) = prev.pause_until {
+        if until > Instant::now() {
+            debug!(
+                model = %kick.model_id,
+                reason = ?kick.reason,
+                "Supervisor skip — paused",
+            );
+            return;
+        }
+    }
 
     if matches!(
         prev.fsm,
@@ -559,6 +609,7 @@ mod tests {
             fsm: BackendFsmState::Starting,
             consecutive_failures: 0,
             started_at: Instant::now(),
+            pause_until: None,
         }
     }
 
@@ -567,6 +618,7 @@ mod tests {
             fsm: BackendFsmState::Healthy,
             consecutive_failures: 0,
             started_at: Instant::now(),
+            pause_until: None,
         }
     }
 
@@ -575,6 +627,7 @@ mod tests {
             fsm: BackendFsmState::Suspect,
             consecutive_failures: failures,
             started_at: Instant::now(),
+            pause_until: None,
         }
     }
 
@@ -623,6 +676,7 @@ mod tests {
             fsm: BackendFsmState::Starting,
             consecutive_failures: 0,
             started_at: Instant::now() - Duration::from_secs(6 * 60),
+            pause_until: None,
         };
         let next = transition(&prev, ProbeOutcome::TransportFailure);
         assert_eq!(next.fsm, BackendFsmState::Suspect);
@@ -700,6 +754,7 @@ mod tests {
             fsm: BackendFsmState::Crashed,
             consecutive_failures: 2,
             started_at: Instant::now(),
+            pause_until: None,
         };
         // No outcome should move out of Crashed in Phase 3.
         for outcome in [
@@ -727,6 +782,7 @@ mod tests {
             fsm: BackendFsmState::Quarantined,
             consecutive_failures: 0,
             started_at: Instant::now(),
+            pause_until: None,
         };
         let next = transition(&prev, ProbeOutcome::HealthyOk);
         assert_eq!(next.fsm, BackendFsmState::Quarantined);
@@ -742,6 +798,7 @@ mod tests {
             fsm: BackendFsmState::Starting,
             consecutive_failures: 0,
             started_at: Instant::now() - Duration::from_secs(6 * 60),
+            pause_until: None,
         };
         let next = transition(&prev, ProbeOutcome::TransportFailure);
         let next2 = transition(&next, ProbeOutcome::TransportFailure);
@@ -754,6 +811,7 @@ mod tests {
             fsm: BackendFsmState::Starting,
             consecutive_failures: 0,
             started_at: Instant::now() - Duration::from_secs(30),
+            pause_until: None,
         };
         let next = transition(&prev, ProbeOutcome::TransportFailure);
         let next2 = transition(&next, ProbeOutcome::TransportFailure);
@@ -793,13 +851,172 @@ mod tests {
         assert!(state.supervisor_map.is_empty());
     }
 
+    // -----------------------------------------------------------------------
+    // pause_supervision / arm_supervision_starting helpers (regression-fix).
+    // -----------------------------------------------------------------------
+
     #[tokio::test]
-    async fn register_starting_inserts_starting_entry() {
+    async fn pause_supervision_on_existing_entry_keeps_state_updates_pause() {
         let map: SupervisorMap = Arc::new(DashMap::new());
-        register_starting(&map, "alpha");
-        let s = map.get("alpha").expect("alpha registered");
+        // Pre-existing Healthy entry.
+        map.insert(
+            "alpha".to_string(),
+            BackendState {
+                fsm: BackendFsmState::Healthy,
+                consecutive_failures: 0,
+                started_at: Instant::now(),
+                pause_until: None,
+            },
+        );
+
+        pause_supervision(&map, "alpha", Duration::from_secs(30));
+
+        let s = map.get("alpha").expect("entry present");
+        assert_eq!(s.fsm, BackendFsmState::Healthy, "fsm unchanged");
+        let until = s.pause_until.expect("pause_until set");
+        assert!(until > Instant::now(), "pause_until is in the future");
+    }
+
+    #[tokio::test]
+    async fn pause_supervision_on_absent_entry_creates_starting_with_pause() {
+        let map: SupervisorMap = Arc::new(DashMap::new());
+        pause_supervision(&map, "alpha", Duration::from_secs(30));
+
+        let s = map.get("alpha").expect("entry created");
         assert_eq!(s.fsm, BackendFsmState::Starting);
         assert_eq!(s.consecutive_failures, 0);
+        let until = s.pause_until.expect("pause_until set");
+        assert!(until > Instant::now());
+    }
+
+    #[tokio::test]
+    async fn arm_supervision_starting_replaces_any_state() {
+        let map: SupervisorMap = Arc::new(DashMap::new());
+        // Pre-existing Crashed entry with a paused deadline.
+        map.insert(
+            "alpha".to_string(),
+            BackendState {
+                fsm: BackendFsmState::Crashed,
+                consecutive_failures: 5,
+                started_at: Instant::now() - Duration::from_secs(120),
+                pause_until: Some(Instant::now() + Duration::from_secs(60)),
+            },
+        );
+
+        arm_supervision_starting(&map, "alpha");
+
+        let s = map.get("alpha").expect("entry present");
+        assert_eq!(s.fsm, BackendFsmState::Starting);
+        assert_eq!(s.consecutive_failures, 0);
+        assert!(s.pause_until.is_none(), "pause cleared");
+    }
+
+    #[tokio::test]
+    async fn arm_supervision_starting_on_absent_creates_starting() {
+        let map: SupervisorMap = Arc::new(DashMap::new());
+        arm_supervision_starting(&map, "alpha");
+
+        let s = map.get("alpha").expect("entry created");
+        assert_eq!(s.fsm, BackendFsmState::Starting);
+        assert_eq!(s.consecutive_failures, 0);
+        assert!(s.pause_until.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_kick early-return regression coverage (regression-fix).
+    //
+    // The bug: tick generator iterated supervisor_map and probed every
+    // entry, including stale `Healthy` entries left over after a Stop or
+    // sitting in the brief replace-and-recreate window of a manual restart.
+    // The fix:
+    // 1. handle_kick returns early when the entry is absent (post_stop_cleanup
+    //    removes the entry; never-started models simply have none).
+    // 2. handle_kick returns early when an entry's pause_until is in the
+    //    future (manual-restart window).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn handle_kick_skips_if_entry_absent_tick() {
+        let state = build_test_state().await;
+        // Map empty by construction.
+        assert!(state.supervisor_map.is_empty());
+
+        let client = reqwest::Client::new();
+        handle_kick(
+            &state,
+            &client,
+            ProbeKick {
+                model_id: "ghost".to_string(),
+                reason: ProbeReason::Tick,
+            },
+        )
+        .await;
+
+        // Map still empty — handle_kick must not insert a fallback entry
+        // for an untracked model.
+        assert!(
+            state.supervisor_map.is_empty(),
+            "handle_kick must not register an absent model on Tick",
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_kick_skips_if_entry_absent_on_failure() {
+        let state = build_test_state().await;
+        assert!(state.supervisor_map.is_empty());
+
+        let client = reqwest::Client::new();
+        handle_kick(
+            &state,
+            &client,
+            ProbeKick {
+                model_id: "ghost".to_string(),
+                reason: ProbeReason::OnFailure,
+            },
+        )
+        .await;
+
+        assert!(
+            state.supervisor_map.is_empty(),
+            "handle_kick must not register an absent model on OnFailure",
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_kick_skips_when_paused() {
+        let state = build_test_state().await;
+        let started_at = Instant::now() - Duration::from_secs(5);
+        let pause_until = Instant::now() + Duration::from_secs(30);
+
+        // Healthy entry with an active pause.
+        state.supervisor_map.insert(
+            "paused".to_string(),
+            BackendState {
+                fsm: BackendFsmState::Healthy,
+                consecutive_failures: 0,
+                started_at,
+                pause_until: Some(pause_until),
+            },
+        );
+
+        let client = reqwest::Client::new();
+        handle_kick(
+            &state,
+            &client,
+            ProbeKick {
+                model_id: "paused".to_string(),
+                reason: ProbeReason::Tick,
+            },
+        )
+        .await;
+
+        // Entry must be untouched — same fsm, same pause_until, same
+        // consecutive_failures, same started_at.
+        let s = state.supervisor_map.get("paused").expect("entry present");
+        assert_eq!(s.fsm, BackendFsmState::Healthy);
+        assert_eq!(s.consecutive_failures, 0);
+        assert_eq!(s.started_at, started_at);
+        assert_eq!(s.pause_until, Some(pause_until));
     }
 
     // -----------------------------------------------------------------------

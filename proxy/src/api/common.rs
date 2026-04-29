@@ -311,6 +311,17 @@ pub async fn start_container_core(
     let wrapped = WrappedRuntimeJson::parse(&runtime_overrides_json).unwrap_or_default();
     let overrides: ModelRuntimeOverrides = wrapped.cli.clone();
 
+    // Pause supervision for the duration of the container start so the
+    // tick generator doesn't classify the replace-and-recreate window as
+    // a crash. Replaced with a fresh `Starting` entry on Ok via
+    // `arm_supervision_starting`. On Err the pause expires after 60s and
+    // the next supervisor tick reconciles via the existing FSM path.
+    crate::supervisor::pause_supervision(
+        &state.supervisor_map,
+        &model_id,
+        std::time::Duration::from_secs(60),
+    );
+
     let container_result = match backend_type {
         "llamacpp" => {
             let safe_repo = hf_repo.replace('/', "--");
@@ -445,6 +456,12 @@ pub async fn start_container_core(
             // non-quarantined row is a no-op, so we don't gate on a SELECT.
             clear_quarantine(state, &model_id).await;
 
+            // Re-arm supervision against the freshly-launched container.
+            // Replaces the temporary paused entry inserted before
+            // `start_llamacpp` with a fresh `Starting` (no pause), so the
+            // 5-minute startup grace covers the actual model-loading time.
+            crate::supervisor::arm_supervision_starting(&state.supervisor_map, &model_id);
+
             let url = state
                 .docker
                 .backend_base_url(&model_id, backend_type)
@@ -463,10 +480,19 @@ pub async fn start_container_core(
 // Container lifecycle: post-stop cleanup
 // ---------------------------------------------------------------------------
 
-/// Shared cleanup after stopping a container: unregister gate, delete secrets,
-/// mark model as unloaded.
+/// Shared cleanup after stopping a container: unregister gate, drop the
+/// supervisor and worked maps, delete secrets, mark model as unloaded.
+///
+/// Removing the supervisor entry is what stops the 10s tick generator from
+/// queuing further `Tick` kicks for this model. Without it, a kick fired
+/// during the brief Stop→Start window saw the container missing, classified
+/// the model as `ContainerStopped` → immediate `Crashed`, wrote a phantom
+/// `backend_crash_log` row, and either auto-restarted (racing with the
+/// user) or quarantined.
 pub async fn post_stop_cleanup(state: &Arc<AppState>, model_id: &str) {
     state.scheduler.gate().unregister(model_id).await;
+    state.supervisor_map.remove(model_id);
+    state.worked_map.remove(model_id);
     let _ = sqlx::query("DELETE FROM container_secrets WHERE model_id = ?")
         .bind(model_id)
         .execute(&state.db.pool)
@@ -1307,6 +1333,7 @@ mod tests {
                 fsm: crate::supervisor::BackendFsmState::Crashed,
                 consecutive_failures: 2,
                 started_at: std::time::Instant::now(),
+                pause_until: None,
             },
         );
 
@@ -1381,5 +1408,82 @@ mod tests {
         assert!(!s.quarantined);
         assert!(s.quarantine_reason.is_none());
         assert!(s.last_crash.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // post_stop_cleanup regression coverage.
+    //
+    // The Stop→Start phantom-crash bug needs both halves of cleanup to drop
+    // their in-memory entries: removing the supervisor_map entry stops the
+    // tick generator from queuing further kicks for the deliberately-stopped
+    // model, and removing the worked_map entry prevents Phase 6 from racing
+    // a stale `worked = true` against a freshly-started container.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn post_stop_cleanup_removes_supervisor_entry() {
+        let state = build_test_state().await;
+        let model_id = "m-stop-supervisor";
+
+        sqlx::query(
+            "INSERT INTO models (id, hf_repo, filename, backend_type, loaded, runtime_overrides) \
+             VALUES (?, ?, ?, 'llamacpp', 1, '{}')",
+        )
+        .bind(model_id)
+        .bind("owner/repo")
+        .bind("model.gguf")
+        .execute(&state.db.pool)
+        .await
+        .expect("insert model");
+
+        // Pre-populate supervisor_map with a Healthy entry — this is what
+        // the tick generator was iterating during the bug.
+        state.supervisor_map.insert(
+            model_id.to_string(),
+            crate::supervisor::BackendState {
+                fsm: crate::supervisor::BackendFsmState::Healthy,
+                consecutive_failures: 0,
+                started_at: std::time::Instant::now(),
+                pause_until: None,
+            },
+        );
+        assert!(state.supervisor_map.contains_key(model_id));
+
+        super::post_stop_cleanup(&state, model_id).await;
+
+        assert!(
+            !state.supervisor_map.contains_key(model_id),
+            "post_stop_cleanup must remove the supervisor_map entry",
+        );
+    }
+
+    #[tokio::test]
+    async fn post_stop_cleanup_removes_worked_entry() {
+        let state = build_test_state().await;
+        let model_id = "m-stop-worked";
+
+        sqlx::query(
+            "INSERT INTO models (id, hf_repo, filename, backend_type, loaded, runtime_overrides) \
+             VALUES (?, ?, ?, 'llamacpp', 1, '{}')",
+        )
+        .bind(model_id)
+        .bind("owner/repo")
+        .bind("model.gguf")
+        .execute(&state.db.pool)
+        .await
+        .expect("insert model");
+
+        state.worked_map.insert(
+            model_id.to_string(),
+            std::sync::atomic::AtomicBool::new(true),
+        );
+        assert!(state.worked_map.contains_key(model_id));
+
+        super::post_stop_cleanup(&state, model_id).await;
+
+        assert!(
+            !state.worked_map.contains_key(model_id),
+            "post_stop_cleanup must remove the worked_map entry",
+        );
     }
 }

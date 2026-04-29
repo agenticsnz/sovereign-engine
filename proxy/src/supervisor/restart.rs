@@ -255,6 +255,7 @@ pub async fn restart_after_crash(
             fsm: BackendFsmState::Healthy,
             consecutive_failures: 0,
             started_at: Instant::now(),
+            pause_until: None,
         },
     );
 
@@ -565,6 +566,7 @@ mod tests {
                 fsm: BackendFsmState::Crashed,
                 consecutive_failures: 2,
                 started_at: Instant::now(),
+                pause_until: None,
             },
         );
 

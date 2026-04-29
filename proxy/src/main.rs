@@ -98,9 +98,6 @@ async fn main() -> Result<()> {
         warn!("Failed to load scheduler settings from DB: {e}");
     }
 
-    // Recover concurrency gate state from DB for any containers still running
-    recover_gate_state(&scheduler, &db).await;
-
     // NOTE: active reservation recovery happens after Arc<AppState> is built (below)
 
     // Initialize metrics broadcaster
@@ -118,6 +115,12 @@ async fn main() -> Result<()> {
         metrics,
         reservations: reservations_broadcaster,
     });
+
+    // Recover concurrency gate state from DB. Each loaded model is probed via
+    // Docker — phantoms get reconciled (loaded=0, no gate), survivors get a
+    // fresh gate registration. Must run after AppState is built so we can pass
+    // the full Arc to reconcile_dead_backend().
+    recover_gate_state(&state).await;
 
     // Start background metrics collection (broadcasts every 2s)
     state.metrics.spawn_collector(
@@ -423,11 +426,21 @@ fn pick_mmproj_variant(sorted: &[String]) -> String {
 }
 
 /// Re-register concurrency gates for containers that survived a proxy restart.
-async fn recover_gate_state(scheduler: &Scheduler, db: &Database) {
+///
+/// Probes Docker for each model marked `loaded=1`: surviving containers get a
+/// fresh gate registration; phantoms (Docker reports the container gone or
+/// not running) are reconciled via [`api::common::reconcile_dead_backend`] —
+/// `loaded` is cleared, no gate is registered, and a `backend_crash_log` row
+/// is written with `signal = "discovered_at_proxy_startup"`.
+///
+/// This fixes the pre-Phase-2 bug where the proxy would re-register slots for
+/// dead containers after a host reboot, causing requests to hang on a phantom
+/// gate.
+async fn recover_gate_state(state: &Arc<AppState>) {
     let rows: Vec<(String, i64)> = match sqlx::query_as(
         "SELECT cs.model_id, cs.parallel_slots FROM container_secrets cs JOIN models m ON m.id = cs.model_id WHERE m.loaded = 1",
     )
-    .fetch_all(&db.pool)
+    .fetch_all(&state.db.pool)
     .await
     {
         Ok(r) => r,
@@ -441,13 +454,62 @@ async fn recover_gate_state(scheduler: &Scheduler, db: &Database) {
         return;
     }
 
+    let mut recovered = 0usize;
+    let mut reconciled = 0usize;
+
     for (model_id, parallel_slots) in &rows {
+        let container_name = format!("sovereign-llamacpp-{}", model_id);
+
+        // Probe Docker. Treat both an Err result and an Ok-but-not-running
+        // state as "container gone" — either way, the gate must NOT be
+        // re-registered for a phantom backend.
+        let inspect_result = state
+            .docker
+            .docker
+            .inspect_container(&container_name, None)
+            .await;
+
+        let (alive, container_id) = match &inspect_result {
+            Ok(info) => {
+                let running = info
+                    .state
+                    .as_ref()
+                    .and_then(|s| s.running)
+                    .unwrap_or(false);
+                (running, info.id.clone())
+            }
+            Err(_) => (false, None),
+        };
+
+        if !alive {
+            info!(
+                model = %model_id,
+                container = %container_name,
+                "Container gone for loaded model — reconciling",
+            );
+            api::common::reconcile_dead_backend(
+                state,
+                model_id,
+                container_id.as_deref(),
+                "discovered_at_proxy_startup",
+            )
+            .await;
+            reconciled += 1;
+            continue;
+        }
+
         let slots = (*parallel_slots).max(1) as u32;
-        scheduler.gate().register(model_id, slots).await;
+        state.scheduler.gate().register(model_id, slots).await;
         info!(model = %model_id, slots, "Recovered gate state");
+        recovered += 1;
     }
 
-    info!(count = rows.len(), "Gate state recovered from DB");
+    info!(
+        total = rows.len(),
+        recovered,
+        reconciled,
+        "Gate state recovery complete",
+    );
 }
 
 fn build_router(state: Arc<AppState>) -> Router {

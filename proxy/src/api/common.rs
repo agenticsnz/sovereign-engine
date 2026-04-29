@@ -354,6 +354,65 @@ pub async fn post_stop_cleanup(state: &Arc<AppState>, model_id: &str) {
         .await;
 }
 
+/// Reconcile state for a backend whose container has died (or was discovered
+/// gone at proxy startup). Idempotent.
+///
+/// Steps:
+/// 1. Clear `models.loaded = 0`.
+/// 2. Unregister the gate slot (`state.scheduler.gate().unregister(...)`).
+/// 3. Drop in-memory state if any (Phase 4 will populate this).
+/// 4. Write a row to `backend_crash_log` with the supplied `discovery_reason`
+///    (used as the `signal` column for now — Phase 5 adds proper exit-code
+///    capture). `container_id` may be `None` when called from the proxy-startup
+///    path; `occurred_at` is set by the schema default.
+///
+/// `discovery_reason` is a free-form short string, e.g.
+/// `"discovered_at_proxy_startup"` or `"supervisor_probe_failure"`.
+///
+/// Best-effort: a DB failure on the crash-log insert is logged and swallowed
+/// rather than propagated, since reconciliation should never block recovery.
+pub(crate) async fn reconcile_dead_backend(
+    state: &Arc<AppState>,
+    model_id: &str,
+    container_id: Option<&str>,
+    discovery_reason: &str,
+) {
+    // 1. Clear the loaded flag.
+    if let Err(e) = sqlx::query("UPDATE models SET loaded = 0 WHERE id = ?")
+        .bind(model_id)
+        .execute(&state.db.pool)
+        .await
+    {
+        error!(
+            model = %model_id,
+            error = %e,
+            "reconcile_dead_backend: failed to clear loaded flag",
+        );
+    }
+
+    // 2. Unregister the gate slot.
+    state.scheduler.gate().unregister(model_id).await;
+
+    // 3. (Phase 4 hook: drop any in-memory supervisor state here.)
+
+    // 4. Append a crash-log row.
+    if let Err(e) = sqlx::query(
+        "INSERT INTO backend_crash_log (model_id, container_id, signal) VALUES (?, ?, ?)",
+    )
+    .bind(model_id)
+    .bind(container_id)
+    .bind(discovery_reason)
+    .execute(&state.db.pool)
+    .await
+    {
+        error!(
+            model = %model_id,
+            error = %e,
+            "reconcile_dead_backend: failed to write crash log row",
+        );
+    }
+}
+
 /// Look up backend_type for a model, defaulting to "llamacpp" on any failure.
 pub async fn lookup_backend_type(pool: &SqlitePool, model_id: &str) -> String {
     match sqlx::query_as::<_, (String,)>("SELECT backend_type FROM models WHERE id = ?")
@@ -623,5 +682,158 @@ mod tests {
         .expect("fetch row");
 
         assert!(row.mmproj_filename.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // reconcile_dead_backend
+    //
+    // Verifies the Phase-2 helper clears the loaded flag, unregisters the gate
+    // slot, and writes a single backend_crash_log row carrying the supplied
+    // `discovery_reason` in the `signal` column.
+    // -----------------------------------------------------------------------
+
+    fn test_config_for_reconcile() -> crate::config::AppConfig {
+        crate::config::AppConfig {
+            listen_addr: "127.0.0.1:0".to_string(),
+            database_url: "sqlite::memory:".to_string(),
+            tls_cert_path: None,
+            tls_key_path: None,
+            bootstrap_user: None,
+            bootstrap_password: None,
+            break_glass: false,
+            docker_host: "unix:///var/run/docker.sock".to_string(),
+            model_path: "/tmp/test-models-reconcile".to_string(),
+            model_host_path: "/tmp/test-models-reconcile".to_string(),
+            ui_path: "/tmp/test-ui".to_string(),
+            api_hostname: "localhost".to_string(),
+            chat_hostname: "localhost".to_string(),
+            cookie_domain: None,
+            backend_network: "test-network".to_string(),
+            acme_contact: None,
+            acme_staging: false,
+            webui_backend_url: "http://localhost:8080".to_string(),
+            webui_api_key: None,
+            queue_timeout_secs: 30,
+            secure_cookies: false,
+            db_encryption_key: None,
+            db_encryption_key_old: None,
+        }
+    }
+
+    async fn build_test_state() -> Arc<AppState> {
+        let db = crate::db::Database::test_db().await;
+        Arc::new(AppState {
+            config: test_config_for_reconcile(),
+            db,
+            docker: crate::docker::DockerManager::test_dummy(),
+            scheduler: crate::scheduler::Scheduler::new(),
+            metrics: crate::metrics::MetricsBroadcaster::new(),
+            reservations: crate::scheduler::reservation::ReservationBroadcaster::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn reconcile_dead_backend_clears_loaded_and_writes_crash_row() {
+        let state = build_test_state().await;
+        let model_id = "m-reconcile";
+
+        // Seed: a loaded model row.
+        sqlx::query(
+            "INSERT INTO models (id, hf_repo, filename, backend_type, loaded, runtime_overrides) \
+             VALUES (?, ?, ?, 'llamacpp', 1, '{}')",
+        )
+        .bind(model_id)
+        .bind("owner/repo")
+        .bind("model.gguf")
+        .execute(&state.db.pool)
+        .await
+        .expect("insert model");
+
+        // Pre-register a gate slot so we can confirm reconcile clears it.
+        state.scheduler.gate().register(model_id, 2).await;
+        let snapshot_before = state.scheduler.gate().status().await;
+        assert!(snapshot_before.contains_key(model_id));
+
+        // Act
+        super::reconcile_dead_backend(
+            &state,
+            model_id,
+            Some("container-id-abc"),
+            "test_reason",
+        )
+        .await;
+
+        // Assert: loaded cleared.
+        let loaded: i64 = sqlx::query_scalar("SELECT loaded FROM models WHERE id = ?")
+            .bind(model_id)
+            .fetch_one(&state.db.pool)
+            .await
+            .expect("query loaded");
+        assert_eq!(loaded, 0, "loaded should be cleared");
+
+        // Assert: gate slot removed.
+        let snapshot_after = state.scheduler.gate().status().await;
+        assert!(
+            !snapshot_after.contains_key(model_id),
+            "gate slot should be unregistered"
+        );
+
+        // Assert: exactly one crash log row, with signal=test_reason.
+        let crash_rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT model_id, container_id, signal FROM backend_crash_log WHERE model_id = ?",
+        )
+        .bind(model_id)
+        .fetch_all(&state.db.pool)
+        .await
+        .expect("query crash log");
+
+        assert_eq!(crash_rows.len(), 1, "expected exactly one crash log row");
+        let (logged_model, logged_container, logged_signal) = &crash_rows[0];
+        assert_eq!(logged_model, model_id);
+        assert_eq!(logged_container.as_deref(), Some("container-id-abc"));
+        assert_eq!(logged_signal.as_deref(), Some("test_reason"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_dead_backend_handles_missing_container_id() {
+        let state = build_test_state().await;
+        let model_id = "m-no-container";
+
+        sqlx::query(
+            "INSERT INTO models (id, hf_repo, filename, backend_type, loaded, runtime_overrides) \
+             VALUES (?, ?, ?, 'llamacpp', 1, '{}')",
+        )
+        .bind(model_id)
+        .bind("owner/repo")
+        .bind("model.gguf")
+        .execute(&state.db.pool)
+        .await
+        .expect("insert model");
+
+        // No prior gate registration — reconcile must still be idempotent.
+        super::reconcile_dead_backend(
+            &state,
+            model_id,
+            None,
+            "discovered_at_proxy_startup",
+        )
+        .await;
+
+        let loaded: i64 = sqlx::query_scalar("SELECT loaded FROM models WHERE id = ?")
+            .bind(model_id)
+            .fetch_one(&state.db.pool)
+            .await
+            .expect("query loaded");
+        assert_eq!(loaded, 0);
+
+        let crash: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT container_id, signal FROM backend_crash_log WHERE model_id = ?",
+        )
+        .bind(model_id)
+        .fetch_one(&state.db.pool)
+        .await
+        .expect("query crash log");
+        assert!(crash.0.is_none(), "container_id should be NULL");
+        assert_eq!(crash.1.as_deref(), Some("discovered_at_proxy_startup"));
     }
 }

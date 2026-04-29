@@ -13,7 +13,9 @@ use uuid::Uuid;
 
 use super::error;
 use crate::db::models::{Model, ModelCategory};
-use crate::docker::runtime_overrides::ModelRuntimeOverrides;
+use crate::docker::runtime_overrides::{
+    ModelRuntimeOverrides, PersistedLaunchConfig, WrappedRuntimeJson,
+};
 use crate::metrics::ContainerStatus;
 use crate::AppState;
 
@@ -194,6 +196,16 @@ pub async fn start_container_core(
         .map_err(|e| error::internal_error("start_container:allocate_uid", e))?;
     let api_key = Uuid::new_v4().to_string();
 
+    // A bad JSON blob in the DB shouldn't keep the model from starting —
+    // fall back to defaults (i.e. no overrides) and carry on.
+    // `WrappedRuntimeJson::parse` accepts both the new wrapped shape
+    // (`{"cli": {...}, "launch": {...}}`) and the legacy bare
+    // `ModelRuntimeOverrides` shape — legacy blobs surface as
+    // `cli=<legacy>, launch=<default>`. Lifted out of the backend-type match
+    // so the post-start write-back can see `wrapped.cli`.
+    let wrapped = WrappedRuntimeJson::parse(&runtime_overrides_json).unwrap_or_default();
+    let overrides: ModelRuntimeOverrides = wrapped.cli.clone();
+
     let container_result = match backend_type {
         "llamacpp" => {
             let safe_repo = hf_repo.replace('/', "--");
@@ -216,10 +228,6 @@ pub async fn start_container_core(
                 .map(|f| format!("{}/{}", safe_repo, f));
 
             let parallel = params.parallel.unwrap_or(1).max(1);
-            // A bad JSON blob in the DB shouldn't keep the model from starting —
-            // fall back to defaults (i.e. no overrides) and carry on.
-            let overrides = serde_json::from_str::<ModelRuntimeOverrides>(&runtime_overrides_json)
-                .unwrap_or_default();
             let llamacpp_config = crate::docker::llamacpp::LlamacppConfig {
                 model_id: model_id.clone(),
                 gguf_path,
@@ -247,6 +255,47 @@ pub async fn start_container_core(
 
     match container_result {
         Ok(container_name) => {
+            // Persist the launch sub-struct so the supervisor can rebuild
+            // `LlamacppConfig` on restart without re-prompting the operator.
+            // Done BEFORE gate-register / loaded=1 so a crash mid-bookkeeping
+            // doesn't leave us with a stale runtime_overrides blob. A failure
+            // here is logged and swallowed — the supervisor's legacy-data path
+            // (Phase 3) skips models without a launch sub-struct rather than
+            // breaking the start.
+            let new_wrapped = WrappedRuntimeJson {
+                cli: wrapped.cli,
+                launch: PersistedLaunchConfig {
+                    gpu_type: params.gpu_type.clone(),
+                    gpu_layers: params.gpu_layers,
+                    parallel: params.parallel,
+                },
+            };
+            match new_wrapped.to_json() {
+                Ok(blob) => {
+                    if let Err(e) = sqlx::query(
+                        "UPDATE models SET runtime_overrides = ? WHERE id = ?",
+                    )
+                    .bind(&blob)
+                    .bind(&model_id)
+                    .execute(&state.db.pool)
+                    .await
+                    {
+                        error!(
+                            model = %model_id,
+                            error = %e,
+                            "Failed to persist launch config",
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        model = %model_id,
+                        error = %e,
+                        "Failed to serialise launch config",
+                    );
+                }
+            }
+
             // Post-start bookkeeping: persist secrets, register gate, mark loaded
             let parallel_slots = params.parallel.unwrap_or(1).max(1);
             if let Err(e) = sqlx::query(

@@ -111,6 +111,63 @@ impl ModelRuntimeOverrides {
     }
 }
 
+/// Persistence-only sibling of [`ModelRuntimeOverrides`] holding the
+/// container-launch knobs the supervisor needs to rebuild a `LlamacppConfig`
+/// after a crash.
+///
+/// These fields are inert at CLI-build time — they intentionally do NOT flow
+/// through `to_cli_args()`. They reproduce values already passed via
+/// `StartContainerParams` so the supervisor can reconstruct the start call
+/// without re-prompting the operator. Stored in the same
+/// `models.runtime_overrides` JSON column under the `launch` top-level key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PersistedLaunchConfig {
+    pub gpu_type: Option<String>,
+    pub gpu_layers: Option<u32>,
+    pub parallel: Option<u32>,
+}
+
+/// Wrapper for the on-disk shape of `models.runtime_overrides`.
+///
+/// New shape: `{"cli": {...}, "launch": {...}}`. Legacy shape (pre-supervisor)
+/// is the bare `ModelRuntimeOverrides` JSON; [`WrappedRuntimeJson::parse`]
+/// transparently accepts both — legacy blobs are surfaced as
+/// `{cli: <legacy>, launch: <default>}`. The Phase 3 supervisor logs and
+/// skips models whose launch sub-struct is still default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WrappedRuntimeJson {
+    pub cli: ModelRuntimeOverrides,
+    pub launch: PersistedLaunchConfig,
+}
+
+impl WrappedRuntimeJson {
+    /// Parse `models.runtime_overrides` JSON. Accepts both the new wrapped
+    /// shape and the legacy bare [`ModelRuntimeOverrides`] shape (treated as
+    /// `cli` only, `launch` defaulted).
+    ///
+    /// Note: a legacy blob like `{"cache_ram_mib": 0}` has `cache_ram_mib` at
+    /// the top level, which fails wrapped parse (`deny_unknown_fields`). We
+    /// then fall through to bare parse. An empty `{}` parses successfully as
+    /// wrapped (both sub-structs default).
+    pub fn parse(blob: &str) -> Result<Self, serde_json::Error> {
+        if let Ok(wrapped) = serde_json::from_str::<Self>(blob) {
+            return Ok(wrapped);
+        }
+        let cli: ModelRuntimeOverrides = serde_json::from_str(blob)?;
+        Ok(Self {
+            cli,
+            launch: PersistedLaunchConfig::default(),
+        })
+    }
+
+    /// Serialise into the wrapped shape for write-back.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,5 +372,87 @@ mod tests {
         let json = serde_json::to_string(&original).expect("serialize");
         let back: ModelRuntimeOverrides = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(original, back);
+    }
+}
+
+#[cfg(test)]
+mod wrapped_tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_wrapped_with_both_substructs_populated() {
+        let original = WrappedRuntimeJson {
+            cli: ModelRuntimeOverrides {
+                cache_ram_mib: Some(0),
+                swa_full: Some(true),
+                ctx_checkpoints: Some(32),
+                cache_reuse: Some(256),
+                extra: vec!["--threads".into(), "8".into()],
+            },
+            launch: PersistedLaunchConfig {
+                gpu_type: Some("cuda".into()),
+                gpu_layers: Some(99),
+                parallel: Some(4),
+            },
+        };
+        let json = original.to_json().expect("serialize");
+        let back = WrappedRuntimeJson::parse(&json).expect("parse");
+        assert_eq!(original, back);
+    }
+
+    #[test]
+    fn roundtrip_empty_wrapped_object_parses_as_default() {
+        let parsed = WrappedRuntimeJson::parse("{}").expect("parse");
+        assert_eq!(parsed, WrappedRuntimeJson::default());
+        assert_eq!(parsed.cli, ModelRuntimeOverrides::default());
+        assert_eq!(parsed.launch, PersistedLaunchConfig::default());
+    }
+
+    #[test]
+    fn backward_compat_legacy_empty_bare_shape_parses_as_default() {
+        // Empty `{}` parses successfully via the wrapped path (both
+        // sub-structs default). Result is the same as
+        // `WrappedRuntimeJson::default()`.
+        let parsed = WrappedRuntimeJson::parse("{}").expect("parse");
+        assert_eq!(parsed.cli, ModelRuntimeOverrides::default());
+        assert_eq!(parsed.launch, PersistedLaunchConfig::default());
+    }
+
+    #[test]
+    fn backward_compat_legacy_bare_shape_with_cache_ram_mib() {
+        // Legacy on-disk blob: bare ModelRuntimeOverrides shape.
+        // Wrapped parse fails (unknown field "cache_ram_mib" at top level),
+        // we fall through to bare parse.
+        let parsed =
+            WrappedRuntimeJson::parse(r#"{"cache_ram_mib": 0}"#).expect("parse");
+        assert_eq!(parsed.cli.cache_ram_mib, Some(0));
+        assert_eq!(parsed.launch, PersistedLaunchConfig::default());
+    }
+
+    #[test]
+    fn rejects_unknown_field_in_launch_substruct() {
+        let blob = r#"{"cli": {}, "launch": {"gpu_typo": "cuda"}}"#;
+        let err = WrappedRuntimeJson::parse(blob).unwrap_err();
+        // The wrapped parse fails on the unknown launch field; the bare-parse
+        // fallback also fails (top-level `cli`/`launch` aren't legacy fields).
+        // We surface the bare-parse error, which mentions one of the unknown
+        // top-level keys.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cli") || msg.contains("launch"),
+            "expected unknown-field error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_top_level_key() {
+        // `garbage_field` is neither `cli`/`launch` nor a legacy override field,
+        // so it fails wrapped parse and fails bare parse.
+        let blob = r#"{"garbage_field": 42}"#;
+        let err = WrappedRuntimeJson::parse(blob).unwrap_err();
+        assert!(
+            err.to_string().contains("garbage_field"),
+            "expected unknown-field error mentioning garbage_field, got: {err}"
+        );
     }
 }

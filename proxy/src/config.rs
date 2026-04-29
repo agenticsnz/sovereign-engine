@@ -77,6 +77,14 @@ pub struct AppConfig {
     /// The migration will re-encrypt secrets from old key to new key on startup.
     /// Remove after one successful startup cycle.
     pub db_encryption_key_old: Option<String>,
+
+    /// Filesystem root for proxy-managed runtime artefacts (crash log dumps,
+    /// future per-feature subdirs). Defaults to `/config` to match the
+    /// `./data:/config` Docker bind-mount in `docker-compose.runtime.yml`,
+    /// which is also where the SQLite DB lives. Phase 5 of the supervisor
+    /// feature writes `<data_path>/crash_logs/<model_id>-<unix_ts>.log`
+    /// here; `gc_crash_logs` keeps that subdir under 1 GiB.
+    pub data_path: String,
 }
 
 /// ACME configuration derived from hostnames and contact email.
@@ -132,6 +140,7 @@ impl AppConfig {
             db_encryption_key_old: std::env::var("DB_ENCRYPTION_KEY_OLD")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            data_path: std::env::var("DATA_PATH").unwrap_or_else(|_| "/config".into()),
         })
     }
 
@@ -224,6 +233,7 @@ mod tests {
             secure_cookies: true,
             db_encryption_key: None,
             db_encryption_key_old: None,
+            data_path: "/tmp/test-data-path".to_string(),
         }
     }
 

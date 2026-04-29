@@ -29,6 +29,16 @@ use dashmap::DashMap;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+pub mod capture;
+// Re-export the Phase 5 capture types/functions at the supervisor module
+// root so callers can write `crate::supervisor::CrashCapture` etc. without
+// reaching into the submodule. The functions are also used directly via
+// `capture::…` from `handle_kick` below.
+#[allow(unused_imports)]
+pub use capture::{
+    capture_crash_state, gc_crash_logs, write_crash_log_file, CrashCapture, CRASH_LOGS_MAX_BYTES,
+};
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -464,13 +474,41 @@ async fn handle_kick(state: &Arc<crate::AppState>, client: &reqwest::Client, kic
             ?outcome,
             "Supervisor flipped backend to Crashed",
         );
-        crate::api::common::reconcile_dead_backend(
+
+        // SAFETY (Phase 5): capture MUST run before any code path that could
+        // remove the container. `start_llamacpp` (proxy/src/docker/llamacpp.rs:155)
+        // calls `remove_container` on any non-running container before
+        // starting fresh — once Docker removes the container, its logs are
+        // gone forever. Phase 6 will add the restart call **after** this
+        // capture/reconcile block; do not reorder.
+        let container_name = format!("sovereign-llamacpp-{}", kick.model_id);
+        let crash_capture = capture::capture_crash_state(
+            &state.docker.docker,
+            &container_name,
+        )
+        .await;
+        let unix_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let data_path = std::path::Path::new(&state.config.data_path);
+        let log_path = capture::write_crash_log_file(
+            data_path,
+            &kick.model_id,
+            unix_ts,
+            &crash_capture.log_tail,
+        )
+        .await;
+        crate::api::common::reconcile_dead_backend_with_capture(
             state,
             &kick.model_id,
-            None, // Phase 5 will fill container_id from inspect.
+            &crash_capture,
+            log_path.as_deref(),
             "supervisor_probe_failure",
         )
         .await;
+        let crash_logs_dir = data_path.join("crash_logs");
+        capture::gc_crash_logs(&crash_logs_dir, capture::CRASH_LOGS_MAX_BYTES).await;
     }
 }
 
@@ -792,6 +830,7 @@ mod tests {
                 secure_cookies: false,
                 db_encryption_key: None,
                 db_encryption_key_old: None,
+                data_path: "/tmp/test-data-path".to_string(),
             },
             db,
             docker: DockerManager::test_dummy(),

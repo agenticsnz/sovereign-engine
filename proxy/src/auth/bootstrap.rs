@@ -94,6 +94,7 @@ mod tests {
             secure_cookies: true,
             db_encryption_key: None,
             db_encryption_key_old: None,
+            data_path: "/tmp/test-data-path".to_string(),
         }
     }
 

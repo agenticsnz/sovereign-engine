@@ -389,30 +389,11 @@ pub(crate) async fn reconcile_dead_backend(
     container_id: Option<&str>,
     discovery_reason: &str,
 ) {
-    // 1. Clear the loaded flag.
-    if let Err(e) = sqlx::query("UPDATE models SET loaded = 0 WHERE id = ?")
-        .bind(model_id)
-        .execute(&state.db.pool)
-        .await
-    {
-        error!(
-            model = %model_id,
-            error = %e,
-            "reconcile_dead_backend: failed to clear loaded flag",
-        );
-    }
+    reconcile_state(state, model_id).await;
 
-    // 2. Unregister the gate slot.
-    state.scheduler.gate().unregister(model_id).await;
-
-    // 3. Drop the in-memory worked-flag entry (Phase 4). A crashed model has
-    //    no entry; the next container-start path re-inserts a `false` atomic.
-    //    The persisted `models.worked` column is intentionally left intact —
-    //    Phase 6's quarantine decision wants to know whether the *previous*
-    //    container instance ever served a 2xx, not just the live one.
-    state.worked_map.remove(model_id);
-
-    // 4. Append a crash-log row.
+    // Append a basic crash-log row. Phase 5's enriched variant
+    // [`reconcile_dead_backend_with_capture`] persists exit_code, oom_killed,
+    // and a log_path on top of what's written here.
     if let Err(e) = sqlx::query(
         "INSERT INTO backend_crash_log (model_id, container_id, signal) VALUES (?, ?, ?)",
     )
@@ -426,6 +407,93 @@ pub(crate) async fn reconcile_dead_backend(
             model = %model_id,
             error = %e,
             "reconcile_dead_backend: failed to write crash log row",
+        );
+    }
+}
+
+/// Shared "clear loaded, unregister gate, drop worked entry" reconciliation
+/// steps. Used by both [`reconcile_dead_backend`] (basic) and
+/// [`reconcile_dead_backend_with_capture`] (Phase 5 enriched) before each
+/// writes its own `backend_crash_log` INSERT.
+///
+/// Idempotent and best-effort.
+pub(crate) async fn reconcile_state(state: &Arc<AppState>, model_id: &str) {
+    // 1. Clear the loaded flag.
+    if let Err(e) = sqlx::query("UPDATE models SET loaded = 0 WHERE id = ?")
+        .bind(model_id)
+        .execute(&state.db.pool)
+        .await
+    {
+        error!(
+            model = %model_id,
+            error = %e,
+            "reconcile_state: failed to clear loaded flag",
+        );
+    }
+
+    // 2. Unregister the gate slot.
+    state.scheduler.gate().unregister(model_id).await;
+
+    // 3. Drop the in-memory worked-flag entry (Phase 4). A crashed model has
+    //    no entry; the next container-start path re-inserts a `false` atomic.
+    //    The persisted `models.worked` column is intentionally left intact —
+    //    Phase 6's quarantine decision wants to know whether the *previous*
+    //    container instance ever served a 2xx, not just the live one.
+    state.worked_map.remove(model_id);
+}
+
+/// Phase 5 enriched variant of [`reconcile_dead_backend`].
+///
+/// Persists captured crash diagnostics — `exit_code`, `oom_killed`, `signal`,
+/// `log_path` — into the `backend_crash_log` row, in addition to the
+/// shared "clear loaded / unregister gate / drop worked entry" steps.
+///
+/// **Caller is responsible for capturing diagnostics via
+/// [`crate::supervisor::capture_crash_state`] BEFORE calling this** — by the
+/// time this function returns, [`crate::supervisor`] (Phase 6) may proceed
+/// to remove and recreate the container, at which point Docker discards the
+/// container's logs.
+///
+/// `signal` precedence: if the inspect call surfaced a non-empty
+/// `state.error` string (`capture.signal`), that value wins; otherwise we
+/// fall back to the supervisor's `discovery_reason` so the row never has a
+/// NULL signal column.
+///
+/// Best-effort: a DB failure on the INSERT is logged and swallowed.
+pub(crate) async fn reconcile_dead_backend_with_capture(
+    state: &Arc<AppState>,
+    model_id: &str,
+    capture: &crate::supervisor::CrashCapture,
+    log_path: Option<&std::path::Path>,
+    discovery_reason: &str,
+) {
+    reconcile_state(state, model_id).await;
+
+    let signal = capture
+        .signal
+        .clone()
+        .unwrap_or_else(|| discovery_reason.to_string());
+    let oom: i64 = if capture.oom_killed { 1 } else { 0 };
+    let log_path_str = log_path.map(|p| p.to_string_lossy().to_string());
+
+    if let Err(e) = sqlx::query(
+        "INSERT INTO backend_crash_log \
+         (model_id, container_id, exit_code, oom_killed, signal, log_path) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(model_id)
+    .bind(capture.container_id.as_deref())
+    .bind(capture.exit_code)
+    .bind(oom)
+    .bind(&signal)
+    .bind(log_path_str.as_deref())
+    .execute(&state.db.pool)
+    .await
+    {
+        error!(
+            model = %model_id,
+            error = %e,
+            "reconcile_dead_backend_with_capture: failed to write crash log row",
         );
     }
 }
@@ -734,6 +802,7 @@ mod tests {
             secure_cookies: false,
             db_encryption_key: None,
             db_encryption_key_old: None,
+            data_path: "/tmp/test-data-path".to_string(),
         }
     }
 
@@ -856,5 +925,141 @@ mod tests {
         .expect("query crash log");
         assert!(crash.0.is_none(), "container_id should be NULL");
         assert_eq!(crash.1.as_deref(), Some("discovered_at_proxy_startup"));
+    }
+
+    // -----------------------------------------------------------------------
+    // reconcile_dead_backend_with_capture (Phase 5)
+    //
+    // Verifies the enriched variant persists exit_code, oom_killed, signal,
+    // and log_path captured from bollard's inspect into `backend_crash_log`.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn reconcile_dead_backend_with_capture_writes_full_row() {
+        let state = build_test_state().await;
+        let model_id = "m-capture";
+
+        sqlx::query(
+            "INSERT INTO models (id, hf_repo, filename, backend_type, loaded, runtime_overrides) \
+             VALUES (?, ?, ?, 'llamacpp', 1, '{}')",
+        )
+        .bind(model_id)
+        .bind("owner/repo")
+        .bind("model.gguf")
+        .execute(&state.db.pool)
+        .await
+        .expect("insert model");
+
+        // Pre-register a gate slot to confirm shared reconcile_state still
+        // unregisters it from the enriched path too.
+        state.scheduler.gate().register(model_id, 4).await;
+
+        // Build a fixed-content CrashCapture to assert we round-trip every
+        // field into the row.
+        let capture = crate::supervisor::CrashCapture {
+            container_id: Some("container-deadbeef".to_string()),
+            exit_code: Some(137),
+            oom_killed: true,
+            finished_at: Some("2026-04-29T07:00:00Z".to_string()),
+            signal: Some("OOMKilled".to_string()),
+            log_tail: b"some log bytes".to_vec(),
+        };
+        let log_path =
+            std::path::PathBuf::from("/config/crash_logs/m-capture-1714377600.log");
+
+        super::reconcile_dead_backend_with_capture(
+            &state,
+            model_id,
+            &capture,
+            Some(&log_path),
+            "supervisor_probe_failure",
+        )
+        .await;
+
+        // loaded cleared.
+        let loaded: i64 = sqlx::query_scalar("SELECT loaded FROM models WHERE id = ?")
+            .bind(model_id)
+            .fetch_one(&state.db.pool)
+            .await
+            .expect("query loaded");
+        assert_eq!(loaded, 0);
+
+        // gate unregistered.
+        let snapshot = state.scheduler.gate().status().await;
+        assert!(!snapshot.contains_key(model_id));
+
+        // exactly one row, all fields populated from capture.
+        let row: (
+            String,
+            Option<String>,
+            Option<i64>,
+            i64,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT model_id, container_id, exit_code, oom_killed, signal, log_path \
+             FROM backend_crash_log WHERE model_id = ?",
+        )
+        .bind(model_id)
+        .fetch_one(&state.db.pool)
+        .await
+        .expect("query crash log");
+        assert_eq!(row.0, model_id);
+        assert_eq!(row.1.as_deref(), Some("container-deadbeef"));
+        assert_eq!(row.2, Some(137));
+        assert_eq!(row.3, 1, "oom_killed should be 1");
+        assert_eq!(row.4.as_deref(), Some("OOMKilled"));
+        assert_eq!(
+            row.5.as_deref(),
+            Some("/config/crash_logs/m-capture-1714377600.log")
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_dead_backend_with_capture_falls_back_to_discovery_reason_for_signal() {
+        let state = build_test_state().await;
+        let model_id = "m-no-signal";
+
+        sqlx::query(
+            "INSERT INTO models (id, hf_repo, filename, backend_type, loaded, runtime_overrides) \
+             VALUES (?, ?, ?, 'llamacpp', 1, '{}')",
+        )
+        .bind(model_id)
+        .bind("owner/repo")
+        .bind("model.gguf")
+        .execute(&state.db.pool)
+        .await
+        .expect("insert model");
+
+        // capture.signal = None — discovery_reason should be persisted.
+        let capture = crate::supervisor::CrashCapture {
+            container_id: None,
+            exit_code: None,
+            oom_killed: false,
+            finished_at: None,
+            signal: None,
+            log_tail: Vec::new(),
+        };
+
+        super::reconcile_dead_backend_with_capture(
+            &state,
+            model_id,
+            &capture,
+            None,
+            "supervisor_probe_failure",
+        )
+        .await;
+
+        let row: (Option<String>, i64, Option<String>) = sqlx::query_as(
+            "SELECT signal, oom_killed, log_path \
+             FROM backend_crash_log WHERE model_id = ?",
+        )
+        .bind(model_id)
+        .fetch_one(&state.db.pool)
+        .await
+        .expect("query crash log");
+        assert_eq!(row.0.as_deref(), Some("supervisor_probe_failure"));
+        assert_eq!(row.1, 0);
+        assert!(row.2.is_none());
     }
 }

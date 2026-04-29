@@ -248,6 +248,7 @@ mod tests {
                 secure_cookies: false,
                 db_encryption_key: None,
                 db_encryption_key_old: None,
+                data_path: "/tmp/test-data-path".to_string(),
             },
             db,
             docker: DockerManager::test_dummy(),

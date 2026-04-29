@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { BrowserRouter, Routes, Route, Link, useLocation } from 'react-router-dom';
-import { getMe, getProviders, logout, setOnUnauthorized } from './api';
+import { getMe, getProviders, bootstrapLogin, logout, setOnUnauthorized } from './api';
 import type { AuthUser, AuthProvider } from './types';
 import { ThemeProvider, useTheme } from './theme';
 import { EventStreamProvider } from './hooks/EventStreamProvider';
@@ -22,24 +22,26 @@ import ThemeToggle from './components/common/ThemeToggle';
 
 // ---- Login Page ----
 
-function LoginPage({ onLogin }: Readonly<{ onLogin: () => void }>) {
+function LoginPage({ onLogin: _onLogin }: Readonly<{ onLogin: () => void }>) {
   const { colors } = useTheme();
   const [providers, setProviders] = useState<AuthProvider[]>([]);
+  const [bootstrapActive, setBootstrapActive] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Bootstrap basic auth
-  const [showBasic, setShowBasic] = useState(false);
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
-  const [basicLoading, setBasicLoading] = useState(false);
-  const [basicError, setBasicError] = useState<string | null>(null);
+  // Break-glass login state
+  const [bgUser, setBgUser] = useState('');
+  const [bgPass, setBgPass] = useState('');
+  const [bgLoading, setBgLoading] = useState(false);
+  const [bgError, setBgError] = useState<string | null>(null);
+  const [bgDisabled, setBgDisabled] = useState(false);
 
   useEffect(() => {
     (async () => {
       try {
-        const provs = await getProviders();
-        setProviders(provs);
+        const resp = await getProviders();
+        setProviders(resp.providers);
+        setBootstrapActive(resp.bootstrap_active);
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Failed to load login providers');
       } finally {
@@ -48,26 +50,32 @@ function LoginPage({ onLogin }: Readonly<{ onLogin: () => void }>) {
     })();
   }, []);
 
-  const handleBasicLogin = async (e: React.SubmitEvent) => {
+  const handleBreakGlassLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    setBasicLoading(true);
-    setBasicError(null);
+    setBgLoading(true);
+    setBgError(null);
     try {
-      // Try to access /auth/me with Basic auth to check if it works
-      const res = await fetch('/auth/me', {
-        headers: {
-          'Authorization': 'Basic ' + btoa(`${username}:${password}`),
-        },
-      });
-      if (res.ok) {
-        onLogin();
+      await bootstrapLogin(bgUser, bgPass);
+      // 204 success — session cookie is now set, navigate to portal root
+      window.location.href = '/portal/';
+    } catch (err) {
+      const status = (err as { status?: number }).status;
+      if (status === 401) {
+        setBgError('Invalid credentials');
+        setBgPass('');
+      } else if (status === 404) {
+        // Break-glass was disabled between page load and submit
+        console.warn('Break-glass login endpoint returned 404 — bootstrap mode was disabled');
+        setBootstrapActive(false);
+      } else if (status === 429) {
+        setBgError('Too many attempts. Please wait a minute and try again.');
+        setBgDisabled(true);
+        setTimeout(() => setBgDisabled(false), 60_000);
       } else {
-        setBasicError('Invalid credentials');
+        setBgError('Login failed. Please try again.');
       }
-    } catch {
-      setBasicError('Login failed');
     } finally {
-      setBasicLoading(false);
+      setBgLoading(false);
     }
   };
 
@@ -132,31 +140,34 @@ function LoginPage({ onLogin }: Readonly<{ onLogin: () => void }>) {
           </div>
         )}
 
-        <div style={{ marginTop: '1.5rem', borderTop: `1px solid ${colors.cardBorder}`, paddingTop: '1rem' }}>
-          <button
-            onClick={() => setShowBasic(!showBasic)}
-            style={{
-              background: 'none',
-              border: 'none',
-              color: colors.link,
-              cursor: 'pointer',
-              fontSize: '0.85rem',
-              textDecoration: 'underline',
-            }}
-          >
-            {showBasic ? 'Hide' : 'Bootstrap / Basic Auth'}
-          </button>
-
-          {showBasic && (
-            <form onSubmit={handleBasicLogin} style={{ marginTop: '1rem', textAlign: 'left' }}>
-              {basicError && <ErrorAlert message={basicError} />}
+        {bootstrapActive && (
+          <div style={{
+            marginTop: '1.5rem',
+            borderTop: `1px solid ${colors.cardBorder}`,
+            paddingTop: '1rem',
+          }}>
+            <div style={{
+              background: colors.badgeWarningBg,
+              border: `1px solid ${colors.warningBannerBorder}`,
+              borderRadius: 6,
+              padding: '0.5rem 0.75rem',
+              marginBottom: '0.75rem',
+              fontSize: '0.8rem',
+              color: colors.warningBannerText,
+              textAlign: 'left',
+            }}>
+              <strong>Admin emergency login</strong> — for break-glass access only. Not the normal login path.
+            </div>
+            <form onSubmit={handleBreakGlassLogin} style={{ textAlign: 'left' }} autoComplete="off">
+              {bgError && <ErrorAlert message={bgError} />}
               <div style={{ marginBottom: '0.75rem' }}>
-                <label htmlFor="basic-username" style={{ display: 'block', marginBottom: '0.25rem', fontSize: '0.85rem', fontWeight: 600, color: colors.textSecondary }}>Username</label>
+                <label htmlFor="bg-username" style={{ display: 'block', marginBottom: '0.25rem', fontSize: '0.85rem', fontWeight: 600, color: colors.textSecondary }}>Username</label>
                 <input
-                  id="basic-username"
+                  id="bg-username"
                   type="text"
-                  value={username}
-                  onChange={(e) => setUsername(e.target.value)}
+                  autoComplete="off"
+                  value={bgUser}
+                  onChange={(e) => setBgUser(e.target.value)}
                   style={{
                     width: '100%',
                     padding: '0.5rem',
@@ -171,12 +182,13 @@ function LoginPage({ onLogin }: Readonly<{ onLogin: () => void }>) {
                 />
               </div>
               <div style={{ marginBottom: '0.75rem' }}>
-                <label htmlFor="basic-password" style={{ display: 'block', marginBottom: '0.25rem', fontSize: '0.85rem', fontWeight: 600, color: colors.textSecondary }}>Password</label>
+                <label htmlFor="bg-password" style={{ display: 'block', marginBottom: '0.25rem', fontSize: '0.85rem', fontWeight: 600, color: colors.textSecondary }}>Password</label>
                 <input
-                  id="basic-password"
+                  id="bg-password"
                   type="password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
+                  autoComplete="off"
+                  value={bgPass}
+                  onChange={(e) => setBgPass(e.target.value)}
                   style={{
                     width: '100%',
                     padding: '0.5rem',
@@ -192,23 +204,23 @@ function LoginPage({ onLogin }: Readonly<{ onLogin: () => void }>) {
               </div>
               <button
                 type="submit"
-                disabled={basicLoading}
+                disabled={bgLoading || bgDisabled}
                 style={{
                   width: '100%',
                   padding: '0.6rem',
-                  background: basicLoading ? colors.buttonPrimaryDisabled : colors.buttonPrimary,
+                  background: (bgLoading || bgDisabled) ? colors.buttonPrimaryDisabled : colors.buttonPrimary,
                   color: '#fff',
                   border: 'none',
                   borderRadius: 4,
-                  cursor: basicLoading ? 'default' : 'pointer',
+                  cursor: (bgLoading || bgDisabled) ? 'default' : 'pointer',
                   fontSize: '0.9rem',
                 }}
               >
-                {basicLoading ? 'Signing in...' : 'Sign In'}
+                {bgLoading ? 'Signing in...' : 'Break-glass Sign In'}
               </button>
             </form>
-          )}
-        </div>
+          </div>
+        )}
       </div>
     </div>
   );

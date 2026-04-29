@@ -91,7 +91,7 @@ Backend containers have **no host port bindings** and are reachable only via the
 - Token **revocation** is supported and checked at validation time. (`auth/tokens.rs:96-109`)
 - Tokens can be **scoped** to specific models or categories, enforcing least-privilege. (`auth/tokens.rs:77-83`)
 - **Admin-only middleware** gates sensitive endpoints (IdP config, model management, user admin). (`auth/mod.rs:239-258`)
-- **Break-glass bootstrap auth** disabled by default (`BREAK_GLASS=false`), requires explicit env var to enable. Only intended for initial setup. (`auth/bootstrap.rs`, `config.rs`)
+- **Break-glass bootstrap login** disabled by default (`BREAK_GLASS=false`), requires `BREAK_GLASS=true` + `BOOTSTRAP_USER` + `BOOTSTRAP_PASSWORD` to enable. When active, a one-shot login form appears at `/portal/` — credentials are submitted once via `POST /auth/bootstrap-login` and a session cookie is issued. HTTP Basic auth is not accepted anywhere in the cookie-protected route tree. Only intended for initial setup.
 
 ### 2.6 Session & Cookie Security
 
@@ -181,15 +181,21 @@ Backend containers have **no host port bindings** and are reachable only via the
 **Status:** Fixed in security hardening pass (2026-02-13).
 **Fix:** Centralised error helpers in `api/error.rs` (`internal_error`, `api_error`). All admin and user API handlers now return generic "Internal server error" to clients while logging the real error with structured `tracing::error!` fields. Intentional user-facing messages (404 "not found", 400 validation) are preserved.
 
-### 3.3 ~~CORS Permissive~~ — REMEDIATED
+### 3.3 ~~CORS Permissive~~ — REMEDIATED (updated 2026-04-29)
 
-**Status:** Fixed in security hardening pass (2026-02-13).
-**Fix:** `CorsLayer::permissive()` replaced with explicit configuration: `AllowOrigin::exact()` from `EXTERNAL_URL`, explicit methods (GET/POST/PUT/DELETE/OPTIONS), explicit headers (Content-Type, Authorization, Accept), `allow_credentials(true)` for cookie-based sessions. (`main.rs:build_cors_layer`)
+**Status:** Initially fixed 2026-02-13; updated in 1.8.0 to address gh#2 (CORS allow-list blocked browser clients on origins other than the API hostname).
+
+**Fix (1.8.0):** The single `build_cors_layer` has been replaced by two CORS layers applied at sub-router level:
+
+- **Strict layer** (`/auth/*`, `/api/*`, `/portal/*`, WebUI fallback): `AllowOrigin::list([api_external_url, chat_external_url])`, `allow_credentials(true)`. Preserves the existing two-origin allow-list for all cookie-bearing routes.
+- **Bearer layer** (`/v1/*` — OpenAI + Anthropic compat routes): `AllowOrigin::any()`, `allow_credentials(false)`. Safe to open to any origin because `/v1/*` is bearer-only. Browsers do not auto-attach `Authorization: Bearer` or `x-api-key`, so CSRF via a third-party page is impossible. With `allow_credentials(false)`, the session cookie is not sent on cross-origin requests to `/v1/*` either.
+
+**tower-http 0.6 quirk:** When `allow_credentials(true)` is set alongside `AllowOrigin::list([...])`, tower-http emits `Access-Control-Allow-Credentials: true` on every preflight response, including ones from non-matching origins. This is safe: browsers require a valid `Access-Control-Allow-Origin` header before they act on `Allow-Credentials`, and that header is absent for non-matching origins. The spurious `Allow-Credentials: true` on no-match preflights does not expand CORS access.
 
 ### 3.4 ~~No `Secure` Flag on Cookies~~ — REMEDIATED
 
 **Status:** Fixed in security hardening pass (2026-02-13).
-**Fix:** Centralised cookie construction via `sessions::build_cookie()` / `sessions::clear_cookie()`. `Secure` flag conditionally added based on `SECURE_COOKIES` env var (default `true`). All cookie-setting code paths updated: OIDC callback, bootstrap auth, logout. (`auth/sessions.rs`, `auth/oidc.rs`)
+**Fix:** Centralised cookie construction via `sessions::build_cookie()` / `sessions::clear_cookie()`. `Secure` flag conditionally added based on `SECURE_COOKIES` env var (default `true`). All cookie-setting code paths updated: OIDC callback, bootstrap login (`POST /auth/bootstrap-login`), logout. (`auth/sessions.rs`, `auth/oidc.rs`)
 
 ### 3.5 ~~No Security Headers (HSTS, CSP, X-Frame-Options)~~ — REMEDIATED
 
@@ -206,10 +212,10 @@ Backend containers have **no host port bindings** and are reachable only via the
 **Status:** Fixed in security hardening pass (2026-02-13).
 **Fix:** `tokens::create_token()` now accepts `expires_in_days` parameter, defaulting to 90 days. `expires_at` is set directly in the INSERT statement. API request field changed from `expires_at` (string) to `expires_in_days` (integer). Internal tokens (Open WebUI) remain non-expiring by design. (`auth/tokens.rs`, `api/user.rs`)
 
-### 3.8 No Rate Limiting on Auth Endpoints — ACCEPTED RISK
+### 3.8 No Rate Limiting on Auth Endpoints — PARTIALLY REMEDIATED (2026-04-29)
 
-**Status:** Accepted risk (2026-02-13).
-**Rationale:** OIDC authentication happens at the IdP, not at our endpoints — brute-force protection is the IdP's responsibility. The `/auth/callback` endpoint receives a one-time authorization code that can only be exchanged once. Bootstrap basic auth is setup-only (`BREAK_GLASS=true`) and disabled by default. Adding a rate-limiting dependency for these low-value attack vectors is over-engineering given the architecture.
+**Status:** Accepted risk for OIDC paths; `POST /auth/bootstrap-login` now rate-limited.
+**Rationale:** OIDC authentication happens at the IdP, not at our endpoints — brute-force protection is the IdP's responsibility. The `/auth/callback` endpoint receives a one-time authorization code that can only be exchanged once. `POST /auth/bootstrap-login` (the break-glass login endpoint introduced in 1.8.0) is rate-limited to 5 attempts per minute per IP via an in-memory `DashMap`. The bootstrap endpoint is still setup-only (`BREAK_GLASS=true`) and disabled by default.
 
 ### 3.9 Docker Socket Access — DOCUMENTED (Architectural)
 
@@ -224,7 +230,7 @@ Backend containers have **no host port bindings** and are reachable only via the
 ### 3.11 First OIDC User Auto-Promoted to Admin — DOCUMENTED
 
 **Status:** Documented (2026-02-13).
-**Deployment sequence:** (1) Set `BREAK_GLASS=true`, configure `BOOTSTRAP_USER`/`BOOTSTRAP_PASSWORD`. (2) Log in via bootstrap auth, configure IdP. (3) The operator completes the first OIDC login and is auto-promoted to admin. (4) Set `BREAK_GLASS=false` in production. The auto-promotion is intentional and matches the single-operator deployment model. Multi-operator deployments should use explicit admin grants via the admin API after initial setup.
+**Deployment sequence:** (1) Set `BREAK_GLASS=true`, `BOOTSTRAP_USER`, and `BOOTSTRAP_PASSWORD`. (2) Open `/portal/` in a browser, enter credentials in the break-glass login form, receive a session cookie. (3) Configure IdP via the admin UI. (4) Complete the first OIDC login — that user is auto-promoted to admin. (5) Set `BREAK_GLASS=false` in production. The auto-promotion is intentional and matches the single-operator deployment model. Multi-operator deployments should use explicit admin grants via the admin API after initial setup.
 
 ### 3.12 ~~No Audit Trail for Admin Actions~~ — REMEDIATED
 
@@ -277,7 +283,7 @@ Backend containers have **no host port bindings** and are reachable only via the
 | SQL injection | **Strong** | Parameterised queries with compile-time checks |
 | XSS prevention | **Strong** | No innerHTML, no dangerouslySetInnerHTML |
 | Error handling | **Strong** | Generic errors to clients, structured server-side logging |
-| CORS | **Strong** | Explicit origin, methods, headers, credentials |
+| CORS | **Strong** | Two-layer split: strict allow-list for cookie routes, open to any origin for bearer-only `/v1/*` (CSRF-immune) |
 | Secret storage | **Strong** | AES-256-GCM encrypted client secrets at rest |
 | Security headers | **Strong** | HSTS, CSP, X-Frame-Options, X-Content-Type-Options |
 | Audit trail | **Good** | Structured audit logging on all admin mutations |
@@ -301,3 +307,4 @@ Backend containers have **no host port bindings** and are reachable only via the
 | 2026-02-13 | 3.6, 3.8 | Accepted risk: HTTP→HTTPS redirect (port 80 not exposed), auth rate limiting (IdP handles brute-force) |
 | 2026-02-13 | 3.9, 3.11 | Documented: Docker socket trust boundary, first-user admin promotion sequence |
 | 2026-02-14 | 3.13, 3.15 | Input length validation on all handlers, Docker health checks enabled |
+| 2026-04-29 | 3.3, 3.8 | CORS two-layer split: bearer-only `/v1/*` open to any origin (CSRF-immune), strict allow-list retained for cookie routes. `POST /auth/bootstrap-login` rate-limited (5/min/IP). HTTP Basic auth removed from all middleware. |

@@ -29,7 +29,7 @@ Open your browser and navigate to the portal URL provided by your administrator 
 You'll see the **Sovereign Engine** sign-in page with one or more sign-in options:
 
 - **SSO / OIDC** — Click **"Sign in with [Provider Name]"** to authenticate through your organisation's identity provider (e.g. Google Workspace, Okta, Keycloak).
-- **Bootstrap / Basic Auth** — If enabled by your administrator, click the **"Bootstrap / Basic Auth"** link to reveal a username and password form.
+- **Break-glass / Admin emergency login** — When `BREAK_GLASS=true` is set with `BOOTSTRAP_USER`/`BOOTSTRAP_PASSWORD`, the portal login page shows a "Break-glass / Admin emergency login" form below the OIDC provider buttons. Submit the form to log in once and receive a session cookie — from that point on you're indistinguishable from any other admin user.
 
 After signing in, you'll be taken to the Dashboard.
 

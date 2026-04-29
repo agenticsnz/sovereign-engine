@@ -18,27 +18,51 @@ Cookie: se_session=<hex-token>
 ```
 Set after OIDC login. 24-hour TTL. Looked up by SHA-256 hash in `sessions` table.
 
-### Bootstrap Basic Auth (`/api/*`, `/auth/me`)
+### Break-glass Login (`POST /auth/bootstrap-login`)
+
+Active when `BREAK_GLASS=true`. Validates credentials against `BOOTSTRAP_USER` and `BOOTSTRAP_PASSWORD` env vars, then mints a session cookie. HTTP Basic Auth is not accepted anywhere.
+
+**Request body:**
+```json
+{ "username": "string", "password": "string" }
 ```
-Authorization: Basic <base64(user:pass)>
+
+**Responses:**
+- `204 No Content` — credentials valid; `Set-Cookie: se_session=<token>` is included in the response. Use this cookie for all subsequent authenticated requests.
+- `401 Unauthorized` — credentials invalid.
+- `404 Not Found` — bootstrap is not active (`BREAK_GLASS` is not `true`).
+- `429 Too Many Requests` — rate limit exceeded (5 requests/min/IP).
+
+**Example:**
+```bash
+# Login and capture the session cookie
+curl -c cookies.txt -s -o /dev/null -w "%{http_code}" \
+  -X POST https://api.example.com/auth/bootstrap-login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"changeme"}'
+
+# Use the cookie for subsequent calls
+curl -b cookies.txt https://api.example.com/api/user/tokens | jq .
 ```
-Active when `BREAK_GLASS=true`. Uses `BOOTSTRAP_USER` and `BOOTSTRAP_PASSWORD` env vars.
 
 ---
 
 ## Auth Routes (`/auth/*`) — No auth required
 
 ### `GET /auth/providers`
-List enabled OIDC providers for the login page.
+List enabled OIDC providers for the login page. Also signals whether the break-glass login form should be shown.
 
 **Response 200:**
 ```json
 {
   "providers": [
     { "id": "string", "name": "string" }
-  ]
+  ],
+  "bootstrap_active": true
 }
 ```
+
+`bootstrap_active` is `true` when `BREAK_GLASS=true` is set server-side. The portal UI renders the break-glass form below the OIDC provider buttons when this field is `true`.
 
 ### `GET /auth/login?idp=<id>`
 Redirects to the OIDC provider's authorization endpoint.
@@ -77,7 +101,7 @@ Returns current session user info. Used by the UI to check auth state.
 
 ---
 
-## User API (`/api/user/*`) — Session or Basic auth required
+## User API (`/api/user/*`) — Session cookie required
 
 ### `GET /api/user/tokens`
 List the authenticated user's API tokens (hashed — never returns plaintext).

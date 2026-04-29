@@ -10,36 +10,9 @@ use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use base64::Engine as _;
 
-use crate::config::AppConfig;
 use crate::db::Database;
 use crate::AppState;
-
-/// Try to authenticate via Basic auth (bootstrap credentials).
-/// Returns SessionAuth if valid bootstrap credentials are present, None otherwise.
-pub(crate) async fn try_bootstrap_auth(
-    headers: &axum::http::HeaderMap,
-    config: &AppConfig,
-    db: &Database,
-) -> Option<SessionAuth> {
-    let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok())?;
-    let basic = auth_header.strip_prefix("Basic ")?;
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(basic)
-        .ok()?;
-    let creds = String::from_utf8(decoded).ok()?;
-    let (user, pass) = creds.split_once(':')?;
-    let user_id = bootstrap::validate_bootstrap(config, db, user, pass)
-        .await
-        .ok()?;
-    Some(SessionAuth {
-        user_id,
-        is_admin: true,
-        email: None,
-        display_name: Some(user.to_string()),
-    })
-}
 
 /// Authenticated user context extracted from a valid Bearer token.
 ///
@@ -122,12 +95,6 @@ pub async fn session_auth_middleware(
     mut req: Request,
     next: Next,
 ) -> Result<Response, Response> {
-    // Try bootstrap auth from header first
-    if let Some(auth) = try_bootstrap_auth(req.headers(), &state.config, &state.db).await {
-        req.extensions_mut().insert(auth);
-        return Ok(next.run(req).await);
-    }
-
     // Try session cookie(s)
     let cookie_header = req
         .headers()
@@ -165,12 +132,6 @@ pub async fn session_auth_redirect_middleware(
     mut req: Request,
     next: Next,
 ) -> Result<Response, Response> {
-    // Try bootstrap auth from header first
-    if let Some(auth) = try_bootstrap_auth(req.headers(), &state.config, &state.db).await {
-        req.extensions_mut().insert(auth);
-        return Ok(next.run(req).await);
-    }
-
     let portal_url = format!("{}/portal/", state.config.api_external_url());
 
     // Try session cookie(s)
@@ -233,4 +194,146 @@ pub async fn admin_only_middleware(req: Request, next: Next) -> Result<Response,
     }
 
     Ok(next.run(req).await)
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests: Basic auth must NOT be accepted by session middleware
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::middleware;
+    use axum::routing::get;
+    use axum::Router;
+    use base64::Engine as _;
+    use tower::ServiceExt;
+
+    use crate::auth::bootstrap;
+    use crate::auth::sessions;
+    use crate::config::AppConfig;
+    use crate::db::Database;
+    use crate::docker::DockerManager;
+    use crate::metrics::MetricsBroadcaster;
+    use crate::scheduler::reservation::ReservationBroadcaster;
+    use crate::scheduler::Scheduler;
+    use crate::AppState;
+
+    fn test_config_with_bootstrap() -> AppConfig {
+        AppConfig {
+            listen_addr: "127.0.0.1:0".to_string(),
+            database_url: "sqlite::memory:".to_string(),
+            tls_cert_path: None,
+            tls_key_path: None,
+            bootstrap_user: Some("admin".to_string()),
+            bootstrap_password: Some("hunter2".to_string()),
+            break_glass: true,
+            docker_host: "unix:///var/run/docker.sock".to_string(),
+            model_path: "/tmp/test-models-authmid".to_string(),
+            model_host_path: "/tmp/test-models-authmid".to_string(),
+            ui_path: "/tmp/test-ui".to_string(),
+            api_hostname: "localhost".to_string(),
+            chat_hostname: "localhost".to_string(),
+            cookie_domain: None,
+            backend_network: "test-network".to_string(),
+            acme_contact: None,
+            acme_staging: false,
+            webui_backend_url: "http://localhost:8080".to_string(),
+            webui_api_key: None,
+            queue_timeout_secs: 30,
+            secure_cookies: false,
+            db_encryption_key: None,
+            db_encryption_key_old: None,
+            data_path: "/tmp/test-data-path".to_string(),
+        }
+    }
+
+    async fn test_app_state(config: AppConfig) -> Arc<AppState> {
+        let db = Database::test_db().await;
+        let (probe_tx, _probe_rx) = crate::supervisor::channel();
+        Arc::new(AppState {
+            config,
+            db,
+            docker: DockerManager::test_dummy(),
+            scheduler: Scheduler::new(),
+            metrics: MetricsBroadcaster::new(),
+            reservations: ReservationBroadcaster::new(),
+            supervisor_map: std::sync::Arc::new(dashmap::DashMap::new()),
+            probe_tx,
+            worked_map: std::sync::Arc::new(dashmap::DashMap::new()),
+        })
+    }
+
+    /// Build a minimal router that wraps a single route with session_auth_middleware.
+    fn session_middleware_router(state: Arc<AppState>) -> Router {
+        Router::new()
+            .route("/api/ping", get(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                super::session_auth_middleware,
+            ))
+            .with_state(state)
+    }
+
+    fn basic_auth_header(user: &str, pass: &str) -> String {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+        format!("Basic {encoded}")
+    }
+
+    /// Regression: Basic auth is no longer accepted by session_auth_middleware.
+    /// A request with valid bootstrap Basic credentials and no cookie must get 401.
+    #[tokio::test]
+    async fn session_middleware_rejects_basic_auth() {
+        let state = test_app_state(test_config_with_bootstrap()).await;
+        let app = session_middleware_router(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/ping")
+            .header("authorization", basic_auth_header("admin", "hunter2"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "Basic auth must not be accepted by session_auth_middleware"
+        );
+    }
+
+    /// A request with a valid session cookie must still be accepted (existing behaviour preserved).
+    #[tokio::test]
+    async fn session_middleware_accepts_valid_cookie() {
+        let state = test_app_state(test_config_with_bootstrap()).await;
+        let db = state.db.clone();
+
+        // Create a bootstrap user and a session for it.
+        let user_id = bootstrap::ensure_bootstrap_user(&db, "admin")
+            .await
+            .expect("ensure_bootstrap_user");
+        let token = sessions::create_session(&db, &user_id)
+            .await
+            .expect("create_session");
+
+        let app = session_middleware_router(state);
+
+        let cookie = format!("se_session={token}");
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/ping")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "Valid session cookie must be accepted"
+        );
+    }
 }

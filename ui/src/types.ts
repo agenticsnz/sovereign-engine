@@ -13,6 +13,11 @@ export interface AuthProvider {
   name: string;
 }
 
+export interface ProvidersResponse {
+  providers: AuthProvider[];
+  bootstrap_active: boolean;
+}
+
 // ---- User Tokens ----
 
 export interface UserToken {

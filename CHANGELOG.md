@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0] - 2026-04-29
+
+### Fixed
+- **gh#2 — CORS allow-list no longer blocks browser clients from arbitrary origins on `/v1/*` routes.** The single `build_cors_layer` has been replaced by two CORS layers applied at sub-router level: a **strict layer** (existing allow-list of `API_HOSTNAME` + `CHAT_HOSTNAME`, `allow_credentials(true)`) covering `/auth/*`, `/api/*`, `/portal/*`, and the WebUI fallback; and a **bearer layer** (`AllowOrigin::any()`, `allow_credentials(false)`) covering `/v1/*` (OpenAI and Anthropic compat routes). The bearer layer is safe to open to any origin because `/v1/*` is bearer-only — browsers do not auto-attach `Authorization: Bearer` or `x-api-key`, making CSRF impossible. Browser-based clients can now call `/v1/*` from any origin (localhost, `file://`, third-party web apps) without adding their origin to a server-side allow-list.
+
+### Changed
+- **HTTP Basic auth is no longer accepted on cookie-protected routes.** `try_bootstrap_auth()` and its three call sites (`session_auth_middleware`, `session_auth_redirect_middleware`, and the `/auth/me` handler) have been removed. The session cookie is the only browser-auto-attached authentication mechanism remaining on the protected route tree.
+- **Bootstrap / break-glass login is now a one-shot form on the portal login page.** Setting `BREAK_GLASS=true` + `BOOTSTRAP_USER` + `BOOTSTRAP_PASSWORD` enables a "Break-glass / Admin emergency login" form below the OIDC provider buttons at `/portal/`. Submitting the form calls `POST /auth/bootstrap-login`, which validates the credentials and issues a session cookie (HTTP 204). The prior mechanism — sending `Authorization: Basic` on every cookie-protected request — no longer works.
+- **`GET /auth/providers` response includes a new `bootstrap_active: bool` field.** The portal UI reads this field to decide whether to render the break-glass form. The `providers` array is unchanged.
+- **`GET /auth/me` is now a pure read-only session endpoint.** It no longer accepts `Authorization: Basic` or silently create sessions; it validates the session cookie and returns the current user's profile.
+
+### Added
+- `POST /auth/bootstrap-login` — public endpoint, active only when `BREAK_GLASS=true` + `BOOTSTRAP_USER` + `BOOTSTRAP_PASSWORD` are all set (`is_bootstrap_active()` gate). Accepts `{"user": "...", "pass": "..."}` JSON body, validates against env-var credentials, calls `sessions::create_session()`, emits `Set-Cookie: se_session=...`, and returns 204 on success. Rate-limited to 5 attempts per minute per IP via an in-memory `DashMap`.
+
+### Removed
+- `try_bootstrap_auth()` helper function and its three call sites in `session_auth_middleware`, `session_auth_redirect_middleware`, and the `/auth/me` handler. HTTP Basic authentication is no longer accepted anywhere in the proxy.
+
+### Security
+- The CSRF attack surface is now reduced to a single browser-auto-attached credential (the `se_session` cookie, scoped `HttpOnly` + `SameSite=Lax`). The previous dual-path (session cookie **or** `Authorization: Basic` on every cookie-protected request) is eliminated.
+- `/v1/*` routes are safely open to any CORS origin because bearer credentials (`Authorization: Bearer` / `x-api-key`) are not auto-attached by browsers. With `allow_credentials(false)` on that layer, the SameSite cookie is not sent cross-origin, and the combination is CSRF-immune by construction.
+- `POST /auth/bootstrap-login` is rate-limited (5 attempts/min/IP) to prevent password guessing during the break-glass window.
+
 ## [1.7.0] - 2026-04-29
 
 ### Added

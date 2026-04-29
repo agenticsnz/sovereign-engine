@@ -2,6 +2,7 @@ import { vi, describe, it, expect, beforeEach } from 'vitest';
 import {
   getMe,
   getProviders,
+  bootstrapLogin,
   logout,
   getUserUsage,
   getUserTokens,
@@ -170,14 +171,42 @@ describe('getMe()', () => {
 });
 
 describe('getProviders()', () => {
-  it('unwraps the providers array', async () => {
+  it('returns the full ProvidersResponse including bootstrap_active', async () => {
     const providers = [{ id: 'p1', name: 'Google' }];
-    mockFetch.mockResolvedValueOnce(okResponse({ providers }));
+    mockFetch.mockResolvedValueOnce(okResponse({ providers, bootstrap_active: true }));
 
     const result = await getProviders();
 
-    expect(result).toEqual(providers);
+    expect(result).toEqual({ providers, bootstrap_active: true });
     expect(mockFetch).toHaveBeenCalledWith('/auth/providers', expect.anything());
+  });
+});
+
+describe('bootstrapLogin()', () => {
+  it('sends POST /auth/bootstrap-login with user and pass as JSON', async () => {
+    mockFetch.mockResolvedValueOnce(noContentResponse());
+
+    await bootstrapLogin('admin', 'secret');
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/auth/bootstrap-login',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ user: 'admin', pass: 'secret' }),
+      }),
+    );
+  });
+
+  it('throws ApiError with status 401 on wrong credentials', async () => {
+    mockFetch.mockResolvedValueOnce(errorResponse(401, { error: 'Unauthorized' }));
+
+    await expect(bootstrapLogin('admin', 'wrong')).rejects.toMatchObject({ status: 401 });
+  });
+
+  it('throws ApiError with status 429 on rate limit', async () => {
+    mockFetch.mockResolvedValueOnce(errorResponse(429, { error: 'Too Many Requests' }));
+
+    await expect(bootstrapLogin('admin', 'pass')).rejects.toMatchObject({ status: 429 });
   });
 });
 

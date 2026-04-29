@@ -1,6 +1,6 @@
 import type {
   AuthUser,
-  AuthProvider,
+  ProvidersResponse,
   UsageResponse,
   UserToken,
   MintedToken,
@@ -96,9 +96,15 @@ export async function getMe(): Promise<AuthUser> {
   return request<AuthUser>('/auth/me');
 }
 
-export async function getProviders(): Promise<AuthProvider[]> {
-  const data = await request<{ providers: AuthProvider[] }>('/auth/providers');
-  return data.providers;
+export async function getProviders(): Promise<ProvidersResponse> {
+  return request<ProvidersResponse>('/auth/providers');
+}
+
+export async function bootstrapLogin(user: string, pass: string): Promise<void> {
+  await request<void>('/auth/bootstrap-login', {
+    method: 'POST',
+    body: JSON.stringify({ user, pass }),
+  });
 }
 
 export async function logout(): Promise<void> {

@@ -76,8 +76,14 @@ Single Docker image containing:
 ### Bootstrap path (break-glass)
 
 ```
-Client -> Basic Auth header -> session_auth_middleware / /auth/me -> validate_bootstrap()
-  +-- BREAK_GLASS=true + credentials match: silently creates session → SessionAuth { is_admin: true }
+1. POST /auth/bootstrap-login  {"username": "...", "password": "..."}
+   -> is_bootstrap_active()? No -> 404
+   -> rate-limit (5/min/IP)? Exceeded -> 429
+   -> validate env-var credentials
+   -> sessions::create_session() -> SessionAuth { is_admin: true }
+   -> 204 No Content + Set-Cookie: se_session=<token>
+2. Subsequent requests: session cookie -> session_auth_middleware -> SessionAuth { is_admin: true }
+   (identical to OIDC path from step 4 onward)
 ```
 
 ### OIDC path
@@ -114,7 +120,7 @@ Routing is split by subdomain (see [ADR 026](decisions/026-subdomain-routing.md)
 Host-based dispatch (Host header → router selection)
 ├── api.<domain>  (API router)
 │   ├── /auth/*          → No auth (public routes for OIDC flow)
-│   ├── /api/*           → session_auth_middleware (cookie or Basic auth)
+│   ├── /api/*           → session_auth_middleware (cookie only)
 │   │   └── /api/admin/* → + admin_only_middleware (checks SessionAuth.is_admin)
 │   ├── /v1/*            → bearer_auth_middleware (API token)
 │   └── /portal/*        → Static file serving (React SPA)
@@ -241,8 +247,9 @@ proxy/src/
 │   ├── mod.rs           — Auth types (AuthUser, SessionAuth). Three middleware functions:
 │   │                      bearer_auth_middleware, session_auth_middleware,
 │   │                      session_auth_redirect_middleware, admin_only_middleware.
-│   ├── bootstrap.rs     — Bootstrap basic auth validation (break-glass). Silently creates a
-│   │                      session on /auth/me so the portal SPA has a cookie.
+│   ├── bootstrap.rs     — Bootstrap credential validation (break-glass). Validates env-var
+│   │                      credentials and ensures a corresponding users row exists. Used only
+│   │                      by POST /auth/bootstrap-login; not involved in middleware-level auth.
 │   ├── oidc.rs          — OIDC routes: /auth/providers, /auth/login, /auth/callback,
 │   │                      /auth/logout, /auth/me. Handles OIDC discovery, auth URL generation,
 │   │                      code exchange (with PKCE), user creation, session creation.

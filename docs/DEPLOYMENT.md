@@ -13,18 +13,23 @@ cd SovereignEngine
 docker compose up --build
 
 # Open in browser
-open http://localhost:3000
-
-# Login with bootstrap credentials
-# Username: admin
-# Password: changeme
+open http://localhost:3000/portal/
 ```
 
 What happens on first start:
 - SQLite database created at `/config/sovereign.db` (in Docker volume `sovereign-config`)
 - Migrations run automatically
-- Bootstrap auth is **not** active by default (`BREAK_GLASS=false`). Set `BREAK_GLASS=true` in your `.env` for initial setup.
+- Bootstrap auth is **not** active by default (`BREAK_GLASS=false`). Set `BREAK_GLASS=true` (plus `BOOTSTRAP_USER` and `BOOTSTRAP_PASSWORD`) in your `.env` for initial setup.
 - Docker networks `sovereign-public`, `sovereign-internal`, and `sovereign-openwebui` created
+
+**First login (break-glass):**
+
+1. Set `BREAK_GLASS=true`, `BOOTSTRAP_USER`, and `BOOTSTRAP_PASSWORD` in `.env` and restart.
+2. Open `https://<API_HOSTNAME>/portal/` (or `http://localhost:3000/portal/` in dev mode) in a browser.
+3. The login page shows a **"Break-glass / Admin emergency login"** form below any configured OIDC providers.
+4. Enter the bootstrap credentials and submit — the proxy validates them, issues a session cookie, and redirects you to the portal.
+5. Configure an OIDC provider via the admin UI (see [OIDC Provider Configuration](#oidc-provider-configuration) below).
+6. Once OIDC is working, set `BREAK_GLASS=false` (or unset) and restart. The break-glass form will no longer appear.
 
 ---
 
@@ -110,15 +115,12 @@ The proxy auto-detects TLS mode in priority order:
 
 Step-by-step for adding an identity provider:
 
-1. **Login with bootstrap credentials:**
-   ```bash
-   # Using curl with Basic auth
-   curl -u admin:changeme http://localhost:3000/api/admin/idps
-   ```
+1. **Log in via the break-glass form** (see First login above) to obtain an admin session cookie.
 
-2. **Register your IdP:**
+2. **Register your IdP** using the admin UI, or via curl with your session cookie:
    ```bash
-   curl -u admin:changeme -X POST http://localhost:3000/api/admin/idps \
+   # Replace <token> with the value of your se_session cookie
+   curl -H "Cookie: se_session=<token>" -X POST http://localhost:3000/api/admin/idps \
      -H "Content-Type: application/json" \
      -d '{
        "name": "My Company SSO",
@@ -142,47 +144,49 @@ Step-by-step for adding an identity provider:
 5. **Once an IdP is configured:**
    - New users are created automatically on first OIDC login
    - First OIDC user is automatically promoted to admin
-   - Consider removing `BREAK_GLASS=true` once OIDC is working
+   - Set `BREAK_GLASS=false` and restart once OIDC is working
 
 ---
 
 ## Model Management
 
+All admin API calls require a session cookie (obtained via OIDC login or the break-glass form). Replace `<token>` with your `se_session` cookie value.
+
 **Search HuggingFace models:**
 ```bash
-curl -u admin:changeme \
+curl -H "Cookie: se_session=<token>" \
   "http://localhost:3000/api/admin/hf/search?q=llama&task=text-generation"
 ```
 
 **Download a model:**
 ```bash
-curl -u admin:changeme -X POST http://localhost:3000/api/admin/hf/download \
+curl -H "Cookie: se_session=<token>" -X POST http://localhost:3000/api/admin/hf/download \
   -H "Content-Type: application/json" \
   -d '{"hf_repo": "meta-llama/Llama-3-8B", "category_id": null}'
 ```
 
 **Check download progress:**
 ```bash
-curl -u admin:changeme http://localhost:3000/api/admin/hf/downloads
+curl -H "Cookie: se_session=<token>" http://localhost:3000/api/admin/hf/downloads
 ```
 
 **Create a model category:**
 ```bash
-curl -u admin:changeme -X POST http://localhost:3000/api/admin/categories \
+curl -H "Cookie: se_session=<token>" -X POST http://localhost:3000/api/admin/categories \
   -H "Content-Type: application/json" \
   -d '{"name": "thinking", "description": "Models for reasoning tasks"}'
 ```
 
 **Start a backend container:**
 ```bash
-curl -u admin:changeme -X POST http://localhost:3000/api/admin/containers/start \
+curl -H "Cookie: se_session=<token>" -X POST http://localhost:3000/api/admin/containers/start \
   -H "Content-Type: application/json" \
   -d '{"model_id": "<model-uuid>"}'
 ```
 
 **Stop a container:**
 ```bash
-curl -u admin:changeme -X POST http://localhost:3000/api/admin/containers/stop \
+curl -H "Cookie: se_session=<token>" -X POST http://localhost:3000/api/admin/containers/stop \
   -H "Content-Type: application/json" \
   -d '{"model_id": "<model-uuid>"}'
 ```
@@ -242,7 +246,7 @@ Logs use `tracing` with structured output. Each request logged by `tower_http::T
 
 **System status API:**
 ```bash
-curl -u admin:changeme http://localhost:3000/api/admin/system
+curl -H "Cookie: se_session=<token>" http://localhost:3000/api/admin/system
 ```
 Returns disk usage (model_path filesystem), container health (running/stopped), and queue depths.
 
@@ -287,11 +291,12 @@ GROUP BY model_id;
 
 **Break-glass mode:**
 If you lose access to all OIDC IdPs or sessions:
-1. Set `BREAK_GLASS=true` in environment
-2. Restart the container
-3. Login with `BOOTSTRAP_USER` / `BOOTSTRAP_PASSWORD`
-4. Reconfigure IdPs as needed
-5. Remove `BREAK_GLASS=true` and restart
+1. Set `BREAK_GLASS=true`, `BOOTSTRAP_USER`, and `BOOTSTRAP_PASSWORD` in the environment.
+2. Restart the container.
+3. Open `https://<API_HOSTNAME>/portal/` in a browser.
+4. The login page shows a "Break-glass / Admin emergency login" form. Enter the bootstrap credentials and submit.
+5. You now have an admin session cookie — reconfigure IdPs via the admin UI as needed.
+6. Set `BREAK_GLASS=false` (or unset) and restart. The break-glass form will no longer appear.
 
 ---
 

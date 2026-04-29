@@ -12,6 +12,8 @@ mod tls;
 #[cfg(test)]
 mod admin_tests;
 #[cfg(test)]
+mod cors_tests;
+#[cfg(test)]
 mod meta_token_tests;
 #[cfg(test)]
 mod reservation_tests;
@@ -533,44 +535,77 @@ async fn recover_gate_state(state: &Arc<AppState>) -> Vec<String> {
 }
 
 fn build_router(state: Arc<AppState>) -> Router {
-    // OIDC auth routes (no auth required)
-    let auth_routes = auth::oidc::routes(state.clone());
+    // Two CORS layers: a strict one (with credentials) for cookie-bearing routes,
+    // and a permissive bearer-only layer (no credentials) for /v1/*. Bearer routes
+    // are CSRF-immune because browsers do not auto-attach Authorization/x-api-key,
+    // so AllowOrigin::any() with allow_credentials(false) is safe — see gh#2.
+    //
+    // CORS is attached at sub-router level so that each route family carries the
+    // correct policy. This avoids any chance of double-wrapping /v1/* with both
+    // layers (tower-http's CorsLayer short-circuits preflights at the first match).
+    let strict_cors = build_strict_cors_layer(&state.config);
+    let bearer_cors = build_bearer_cors_layer();
 
-    // Portal API routes (session auth required)
-    let api_routes = api::routes(state.clone()).layer(middleware::from_fn_with_state(
-        state.clone(),
-        auth::session_auth_middleware,
-    ));
+    // OIDC auth routes (no auth required) — strict CORS (cookies set on callback).
+    let auth_routes = auth::oidc::routes(state.clone()).layer(strict_cors.clone());
 
-    // OpenAI-compatible routes (bearer token auth required)
-    let openai_routes = api::openai::routes(state.clone()).layer(middleware::from_fn_with_state(
-        state.clone(),
-        auth::bearer_auth_middleware,
-    ));
+    // Portal API routes (session auth required) — strict CORS.
+    let api_routes = api::routes(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::session_auth_middleware,
+        ))
+        .layer(strict_cors.clone());
 
-    // Anthropic-compatible routes (bearer token auth required)
-    let anthropic_routes = api::anthropic::routes(state.clone()).layer(
-        middleware::from_fn_with_state(state.clone(), auth::bearer_auth_middleware),
-    );
+    // OpenAI-compatible routes (bearer token auth required) — bearer CORS.
+    // CorsLayer must run OUTSIDE the bearer auth middleware so OPTIONS preflights
+    // (which carry no auth header) are not rejected before they reach CORS.
+    let openai_routes = api::openai::routes(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::bearer_auth_middleware,
+        ))
+        .layer(bearer_cors.clone());
+
+    // Anthropic-compatible routes (bearer token auth required) — bearer CORS.
+    let anthropic_routes = api::anthropic::routes(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::bearer_auth_middleware,
+        ))
+        .layer(bearer_cors.clone());
 
     let ui_path = state.config.ui_path.clone();
 
-    // Open WebUI reverse proxy (session auth with redirect for browsers).
+    // /portal static service. Wrap in a Router so we can attach the strict CORS
+    // layer (nest_service takes a Service, but layering is cleaner via Router).
+    let portal_routes = Router::new()
+        .nest_service(
+            "/",
+            tower_http::services::ServeDir::new(&ui_path).fallback(
+                tower_http::services::ServeFile::new(format!("{}/index.html", ui_path)),
+            ),
+        )
+        .layer(strict_cors.clone());
+
+    // Open WebUI reverse proxy (session auth with redirect for browsers) — strict CORS.
     let webui_fallback = Router::new()
         .fallback(proxy::webui::webui_proxy_handler)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::session_auth_redirect_middleware,
         ))
+        .layer(strict_cors.clone())
         .with_state(state.clone());
 
+    // Outer "shared" layers run on every route. CORS is intentionally NOT here —
+    // each sub-router carries its own CORS layer above.
     let shared_layers = |router: Router| -> Router {
         router
             .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MB
             .layer(middleware::from_fn(security_headers))
             .layer(TraceLayer::new_for_http())
             .layer(CompressionLayer::new())
-            .layer(build_cors_layer(&state.config))
     };
 
     // When both hostnames are the same (dev mode / unconfigured), build a combined
@@ -582,12 +617,7 @@ fn build_router(state: Arc<AppState>) -> Router {
                 .nest("/api", api_routes)
                 .nest("/v1", openai_routes)
                 .nest("/v1", anthropic_routes)
-                .nest_service(
-                    "/portal",
-                    tower_http::services::ServeDir::new(&ui_path).fallback(
-                        tower_http::services::ServeFile::new(format!("{}/index.html", ui_path)),
-                    ),
-                )
+                .nest("/portal", portal_routes)
                 .fallback_service(webui_fallback),
         );
     }
@@ -602,12 +632,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .nest("/api", api_routes)
         .nest("/v1", openai_routes)
         .nest("/v1", anthropic_routes)
-        .nest_service(
-            "/portal",
-            tower_http::services::ServeDir::new(&ui_path).fallback(
-                tower_http::services::ServeFile::new(format!("{}/index.html", ui_path)),
-            ),
-        );
+        .nest("/portal", portal_routes);
 
     let api_hostname = state.config.api_hostname.clone();
     let chat_hostname = state.config.chat_hostname.clone();
@@ -642,7 +667,10 @@ fn build_router(state: Arc<AppState>) -> Router {
     )
 }
 
-fn build_cors_layer(config: &AppConfig) -> CorsLayer {
+/// Strict CORS layer for cookie-bearing routes (`/auth/*`, `/api/*`, `/portal/*`,
+/// WebUI fallback). Allow-list is `api_external_url` + `chat_external_url`, and
+/// `allow_credentials(true)` lets browsers send the session cookie cross-origin.
+pub(crate) fn build_strict_cors_layer(config: &AppConfig) -> CorsLayer {
     let api_origin = config
         .api_external_url()
         .parse::<HeaderValue>()
@@ -671,6 +699,35 @@ fn build_cors_layer(config: &AppConfig) -> CorsLayer {
             axum::http::HeaderName::from_static("x-api-key"),
         ])
         .allow_credentials(true)
+}
+
+/// Permissive CORS layer for `/v1/*` (OpenAI- and Anthropic-compatible bearer
+/// routes). `AllowOrigin::any()` is safe here because these endpoints accept
+/// only `Authorization: Bearer …` / `x-api-key` — browsers do not auto-attach
+/// either, so CSRF is impossible. Credentials are intentionally not enabled
+/// (the wildcard origin would otherwise be a tower-http runtime configuration
+/// error). This lets users call the bearer API from any browser origin
+/// (claude.ai, localhost, file:// → `null`, etc.).
+pub(crate) fn build_bearer_cors_layer() -> CorsLayer {
+    use tower_http::cors::AllowOrigin;
+
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::any())
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::ACCEPT,
+            axum::http::HeaderName::from_static("x-api-key"),
+        ])
+    // No .allow_credentials() — must remain false to be compatible with
+    // AllowOrigin::any().
 }
 
 /// Extract SHA-256 hashes of inline `<script>` blocks from the built index.html

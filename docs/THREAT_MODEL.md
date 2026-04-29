@@ -56,7 +56,7 @@ This document maps the attack surfaces of a Sovereign Engine deployment and show
 | A1 | **Session hijacking** — attacker steals session cookie | HttpOnly (no JS access), SameSite=Lax (no cross-site), Secure flag (no HTTP), SHA-256 hashed in DB, 24h TTL, hourly cleanup. Cookie `Domain` attribute set to parent domain for cross-subdomain sharing when `COOKIE_DOMAIN` is configured. | **Mitigated** |
 | A2 | **API token theft** — attacker obtains `se-{uuid}` token | SHA-256 hashed in DB (irreversible), 90-day default expiry, revocation supported, scoped to model/category | **Mitigated** |
 | A3 | **OIDC flow manipulation** — CSRF, replay, code injection | PKCE (SHA-256), random CSRF token, random nonce (verified in ID token), 10-minute state expiry, no HTTP redirects on OIDC client | **Mitigated** |
-| A4 | **Bootstrap brute force** — attacker guesses BOOTSTRAP_PASSWORD | Disabled by default (`BREAK_GLASS=false`), intended for initial setup only. Constant-time comparison prevents timing side-channel. | **Accepted** (not production-facing) |
+| A4 | **Bootstrap brute force** — attacker guesses BOOTSTRAP_PASSWORD | Disabled by default (`BREAK_GLASS=false`), intended for initial setup only. `POST /auth/bootstrap-login` rate-limited to 5 attempts/min/IP. Constant-time comparison prevents timing side-channel. | **Mitigated** |
 | A5 | **Privilege escalation** — user becomes admin | `admin_only_middleware` checks `is_admin` flag from DB. No client-side role switching. Admin flag set only by DB mutation or first-user auto-promotion. | **Eliminated** |
 | A6 | **First-user auto-promotion** — attacker completes first OIDC login before operator | Intentional for single-operator deployment. Operator should complete OIDC login immediately after configuring IdP via bootstrap auth. | **Documented** |
 
@@ -93,7 +93,7 @@ This document maps the attack surfaces of a Sovereign Engine deployment and show
 |---|--------|------------|--------|
 | H1 | **Clickjacking** | `X-Frame-Options: DENY` on all responses | **Eliminated** |
 | H2 | **MIME sniffing** | `X-Content-Type-Options: nosniff` on all responses | **Eliminated** |
-| H3 | **Permissive CORS** | Explicit origins (API + chat subdomain), explicit methods/headers, `allow_credentials(true)` with SameSite=Lax cookies | **Mitigated** |
+| H3 | **Permissive CORS** | Two-layer split (1.8.0): strict allow-list (`api.*` + `chat.*` origins, `allow_credentials(true)`) for `/auth/*`, `/api/*`, `/portal/*`, and WebUI; `AllowOrigin::any()` with `allow_credentials(false)` for `/v1/*` (bearer-only, CSRF-immune — browsers do not auto-attach `Authorization: Bearer` or `x-api-key`). HTTP Basic auth has been removed from all middleware, eliminating the second browser-auto-attached auth path. | **Mitigated** |
 | H4 | **Missing CSP** | `Content-Security-Policy` with `script-src 'self' sha256-...` (hashes computed from index.html at startup). `style-src 'self' 'unsafe-inline'` (required by Vite). | **Mitigated** |
 | H5 | **Referrer leakage** | `Referrer-Policy: strict-origin-when-cross-origin` on all responses | **Mitigated** |
 | H6 | **Unnecessary browser features** | `Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=()` on all responses | **Mitigated** |
@@ -125,7 +125,7 @@ Several architectural choices address multiple threats simultaneously and were c
 - **MFA is delegated** — the IdP handles multi-factor authentication. Sovereign Engine gets the security benefits without implementing or maintaining MFA.
 - **Rate limiting on auth is the IdP's responsibility** — brute-force protection, account lockout, and suspicious login detection are handled by mature IdP infrastructure (Azure Entra, Okta, Keycloak).
 - **SSO with existing accounts** — in enterprise deployments, users authenticate with their existing Azure Entra / Google Workspace / Okta accounts. No new credentials to manage. Guest accounts in a new tenancy work seamlessly.
-- **Bootstrap auth exists only for initial IdP configuration** — disabled by default, intended to be turned off immediately after setup.
+- **Break-glass login exists only for initial IdP configuration** — disabled by default, intended to be turned off immediately after setup. It is a one-shot form at `/portal/` (not HTTP Basic auth on every request) and is rate-limited.
 
 ### Separate API tokens per application
 
@@ -167,7 +167,7 @@ Several architectural choices address multiple threats simultaneously and were c
 |------|-----------|
 | Docker socket = root-equivalent | Fundamental architectural trust boundary. Proxy is the only consumer. Rust memory safety + input validation reduce exploit surface. |
 | Backend traffic unencrypted | Internal-only network with no host/internet access. Per-container API keys add defence-in-depth. mTLS would add complexity disproportionate to threat. |
-| No application-layer rate limiting on auth endpoints | OIDC auth happens at the IdP (their responsibility). Bootstrap auth (`BREAK_GLASS`) is disabled by default and intended for initial setup only. API tokens are UUID v4 (122 bits of entropy) — brute force is infeasible. Session tokens are 256 bits of randomness. For network-exposed deployments, operators should use a reverse proxy (nginx, Cloudflare) for rate limiting. |
+| No application-layer rate limiting on OIDC endpoints | OIDC auth happens at the IdP (their responsibility). The `/auth/callback` endpoint receives a one-time code. `POST /auth/bootstrap-login` is rate-limited (5/min/IP). API tokens are UUID v4 (122 bits of entropy) — brute force is infeasible. Session tokens are 256 bits of randomness. For network-exposed deployments, operators should use a reverse proxy (nginx, Cloudflare) for additional rate limiting. |
 | No HTTP→HTTPS redirect | Port 80 not exposed in production. HSTS set. Adding port 80 listener increases attack surface. |
 | 24h session TTL | Reasonable for local system. Shorter TTL would cause auth fatigue without proportional security gain. |
 | First OIDC user auto-promoted to admin | Intentional for single-operator deployment. Operator completes first login immediately after IdP setup. |

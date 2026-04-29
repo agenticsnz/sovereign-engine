@@ -101,7 +101,7 @@ SovereignEngine/
 │       │   └── error.rs      # Shared error helpers
 │       ├── auth/
 │       │   ├── mod.rs        # Auth types (AuthUser, SessionAuth), middleware (bearer, session, admin)
-│       │   ├── bootstrap.rs  # Bootstrap basic auth (break-glass)
+│       │   ├── bootstrap.rs  # Bootstrap credential validation for /auth/bootstrap-login
 │       │   ├── oidc.rs       # OIDC login/callback flow (with PKCE)
 │       │   ├── sessions.rs   # Session management (cookie-based)
 │       │   └── tokens.rs     # API token validation (SHA-256 hashed)
@@ -239,7 +239,7 @@ Applied in `main.rs`:
 | Route | Middleware | Auth type |
 |---|---|---|
 | `/auth/*` | None | Unauthenticated (login/callback) |
-| `/api/*` | `session_auth_middleware` | Cookie session or Basic auth |
+| `/api/*` | `session_auth_middleware` | Cookie session |
 | `/api/admin/*` | `session_auth_middleware` + `admin_only_middleware` | Admin session only |
 | `/v1/*` | `bearer_auth_middleware` | API token (Bearer header) |
 | `/portal/*` | None | Static file serving |

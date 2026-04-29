@@ -2,7 +2,7 @@
 
 Self-contained local AI inference platform. A Rust reverse proxy manages llama.cpp backend containers, provides OIDC authentication, fair-use scheduling, and a React dashboard — all in a single Docker image.
 
-**Version:** 1.6.0
+**Version:** 1.8.0
 
 ## Features
 
@@ -103,7 +103,7 @@ Then:
 docker compose up -d
 ```
 
-Open [http://localhost:3000](http://localhost:3000) for Open WebUI, or [http://localhost:3000/portal](http://localhost:3000/portal) for the admin dashboard. Log in with **admin** / **changeme**.
+Open [http://localhost:3000](http://localhost:3000) for Open WebUI, or [http://localhost:3000/portal](http://localhost:3000/portal) for the admin dashboard. On the login page, use the **"Break-glass / Admin emergency login"** form (visible because `BREAK_GLASS=true` is set) to log in with **admin** / **changeme** — this issues a session cookie.
 
 > **Production note:** Set `BREAK_GLASS=false` after configuring an OIDC identity provider. Bootstrap credentials are intended for initial setup only.
 
@@ -132,9 +132,9 @@ curl -s http://localhost:3000/api/user/health | jq .
 | `TLS_KEY_PATH` | _(none)_ | Path to TLS private key PEM file |
 | `ACME_CONTACT` | _(none)_ | Contact email for ACME; enables Let's Encrypt provisioning for both hostnames |
 | `ACME_STAGING` | `false` | Use Let's Encrypt staging environment |
-| `BOOTSTRAP_USER` | _(none)_ | Bootstrap admin username (requires `BREAK_GLASS=true`) |
-| `BOOTSTRAP_PASSWORD` | _(none)_ | Bootstrap admin password (requires `BREAK_GLASS=true`) |
-| `BREAK_GLASS` | `false` | Enable bootstrap credential authentication |
+| `BOOTSTRAP_USER` | _(none)_ | Bootstrap admin username. Set with `BREAK_GLASS=true` to enable the break-glass login form. |
+| `BOOTSTRAP_PASSWORD` | _(none)_ | Bootstrap admin password. Set with `BREAK_GLASS=true` to enable the break-glass login form. |
+| `BREAK_GLASS` | `false` | When `true` (with `BOOTSTRAP_USER` + `BOOTSTRAP_PASSWORD` set), enables a one-shot break-glass login form on the portal login page (`POST /auth/bootstrap-login`). Not HTTP Basic auth — credentials are submitted once via the form and a session cookie is issued. Disable after OIDC is configured. |
 | `DOCKER_HOST` | `unix:///var/run/docker.sock` | Docker socket path |
 | `MODEL_PATH` | `/models` | Model storage path (inside the container) |
 | `MODEL_HOST_PATH` | _(same as MODEL_PATH)_ | Host-side path for model bind mounts into child containers |

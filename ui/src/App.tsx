@@ -22,7 +22,7 @@ import ThemeToggle from './components/common/ThemeToggle';
 
 // ---- Login Page ----
 
-function LoginPage({ onLogin: _onLogin }: Readonly<{ onLogin: () => void }>) {
+function LoginPage() {
   const { colors } = useTheme();
   const [providers, setProviders] = useState<AuthProvider[]>([]);
   const [bootstrapActive, setBootstrapActive] = useState(false);
@@ -593,7 +593,7 @@ function App() {
       {user ? (
         <AuthenticatedApp user={user} onLogout={() => setUser(null)} />
       ) : (
-        <LoginPage onLogin={checkAuth} />
+        <LoginPage />
       )}
     </BrowserRouter>
   );

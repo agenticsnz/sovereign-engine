@@ -177,14 +177,7 @@ async fn preflight_headers(
     uri: &str,
     origin: &str,
 ) -> (StatusCode, Option<String>, axum::http::HeaderMap) {
-    let resp = preflight(
-        router,
-        uri,
-        origin,
-        "POST",
-        "Authorization, Content-Type",
-    )
-    .await;
+    let resp = preflight(router, uri, origin, "POST", "Authorization, Content-Type").await;
     let status = resp.status();
     let allow_origin = resp
         .headers()
@@ -285,8 +278,7 @@ async fn bearer_allowed_localhost() {
 async fn bearer_allowed_null_origin() {
     let state = test_app_state().await;
     let router = bearer_router(state);
-    let (status, allow_origin, _) =
-        preflight_headers(router, "/v1/chat/completions", "null").await;
+    let (status, allow_origin, _) = preflight_headers(router, "/v1/chat/completions", "null").await;
 
     assert!(
         status == StatusCode::OK || status == StatusCode::NO_CONTENT,
@@ -329,7 +321,10 @@ async fn bearer_preflight_no_auth_required() {
         .uri("/v1/chat/completions")
         .header("origin", "https://claude.ai")
         .header("access-control-request-method", "POST")
-        .header("access-control-request-headers", "Authorization, Content-Type")
+        .header(
+            "access-control-request-headers",
+            "Authorization, Content-Type",
+        )
         .body(Body::empty())
         .unwrap();
 
@@ -469,8 +464,7 @@ async fn strict_disallowed_null_origin() {
     let state = test_app_state().await;
     let router = strict_router(state);
 
-    let (_, allow_origin, _) =
-        preflight_headers(router, "/api/user/tokens", "null").await;
+    let (_, allow_origin, _) = preflight_headers(router, "/api/user/tokens", "null").await;
 
     assert!(
         allow_origin.is_none(),
@@ -530,8 +524,7 @@ async fn isolation_v1_no_credentials() {
     let api_origin = state.config.api_external_url();
     let router = bearer_router(state);
 
-    let (_, _, headers) =
-        preflight_headers(router, "/v1/chat/completions", &api_origin).await;
+    let (_, _, headers) = preflight_headers(router, "/v1/chat/completions", &api_origin).await;
 
     assert!(
         !has_header(&headers, "access-control-allow-credentials"),

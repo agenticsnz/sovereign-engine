@@ -6,6 +6,7 @@ mod docker;
 mod metrics;
 mod proxy;
 mod scheduler;
+mod supervisor;
 mod tls;
 
 #[cfg(test)]
@@ -50,6 +51,12 @@ pub struct AppState {
     pub scheduler: Scheduler,
     pub metrics: MetricsBroadcaster,
     pub reservations: ReservationBroadcaster,
+    /// Per-model lifecycle state for the backend supervisor (Phase 3).
+    pub supervisor_map: supervisor::SupervisorMap,
+    /// Hot-path → supervisor channel: a non-2xx response on `proxy_to_backend`
+    /// fires a `ProbeKick` so the supervisor probes the backend immediately
+    /// instead of waiting for the next 10s tick.
+    pub probe_tx: tokio::sync::mpsc::Sender<supervisor::ProbeKick>,
 }
 
 #[tokio::main]
@@ -106,6 +113,11 @@ async fn main() -> Result<()> {
     // Initialize reservation change broadcaster
     let reservations_broadcaster = ReservationBroadcaster::new();
 
+    // Build the supervisor kick channel up-front so the `tx` end can live
+    // on AppState. The matching `rx` is consumed by `supervisor::spawn`
+    // once the state is built and recovery has identified the alive set.
+    let (probe_tx, probe_rx) = supervisor::channel();
+
     // Build shared state
     let state = Arc::new(AppState {
         config: config.clone(),
@@ -114,13 +126,19 @@ async fn main() -> Result<()> {
         scheduler,
         metrics,
         reservations: reservations_broadcaster,
+        supervisor_map: std::sync::Arc::new(dashmap::DashMap::new()),
+        probe_tx,
     });
 
     // Recover concurrency gate state from DB. Each loaded model is probed via
     // Docker — phantoms get reconciled (loaded=0, no gate), survivors get a
     // fresh gate registration. Must run after AppState is built so we can pass
-    // the full Arc to reconcile_dead_backend().
-    recover_gate_state(&state).await;
+    // the full Arc to reconcile_dead_backend(). Returns the model_ids whose
+    // containers were confirmed alive — used to seed the supervisor map.
+    let alive_model_ids = recover_gate_state(&state).await;
+
+    // Spawn the supervisor task: 10s tick, drains probe_rx for hot-path kicks.
+    supervisor::spawn(state.clone(), probe_rx, alive_model_ids);
 
     // Start background metrics collection (broadcasts every 2s)
     state.metrics.spawn_collector(
@@ -436,7 +454,7 @@ fn pick_mmproj_variant(sorted: &[String]) -> String {
 /// This fixes the pre-Phase-2 bug where the proxy would re-register slots for
 /// dead containers after a host reboot, causing requests to hang on a phantom
 /// gate.
-async fn recover_gate_state(state: &Arc<AppState>) {
+async fn recover_gate_state(state: &Arc<AppState>) -> Vec<String> {
     let rows: Vec<(String, i64)> = match sqlx::query_as(
         "SELECT cs.model_id, cs.parallel_slots FROM container_secrets cs JOIN models m ON m.id = cs.model_id WHERE m.loaded = 1",
     )
@@ -446,16 +464,17 @@ async fn recover_gate_state(state: &Arc<AppState>) {
         Ok(r) => r,
         Err(e) => {
             warn!("Failed to query container_secrets for gate recovery: {e}");
-            return;
+            return Vec::new();
         }
     };
 
     if rows.is_empty() {
-        return;
+        return Vec::new();
     }
 
     let mut recovered = 0usize;
     let mut reconciled = 0usize;
+    let mut alive_ids: Vec<String> = Vec::new();
 
     for (model_id, parallel_slots) in &rows {
         let container_name = format!("sovereign-llamacpp-{}", model_id);
@@ -502,6 +521,7 @@ async fn recover_gate_state(state: &Arc<AppState>) {
         state.scheduler.gate().register(model_id, slots).await;
         info!(model = %model_id, slots, "Recovered gate state");
         recovered += 1;
+        alive_ids.push(model_id.clone());
     }
 
     info!(
@@ -510,6 +530,8 @@ async fn recover_gate_state(state: &Arc<AppState>) {
         reconciled,
         "Gate state recovery complete",
     );
+
+    alive_ids
 }
 
 fn build_router(state: Arc<AppState>) -> Router {

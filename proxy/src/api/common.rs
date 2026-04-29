@@ -722,6 +722,7 @@ mod tests {
 
     async fn build_test_state() -> Arc<AppState> {
         let db = crate::db::Database::test_db().await;
+        let (probe_tx, _probe_rx) = crate::supervisor::channel();
         Arc::new(AppState {
             config: test_config_for_reconcile(),
             db,
@@ -729,6 +730,8 @@ mod tests {
             scheduler: crate::scheduler::Scheduler::new(),
             metrics: crate::metrics::MetricsBroadcaster::new(),
             reservations: crate::scheduler::reservation::ReservationBroadcaster::new(),
+            supervisor_map: std::sync::Arc::new(dashmap::DashMap::new()),
+            probe_tx,
         })
     }
 

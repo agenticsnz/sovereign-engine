@@ -1142,6 +1142,8 @@ async fn messages(
             openai_bytes,
             false,
             api_key.as_deref(),
+            &model.id,
+            &state.probe_tx,
         )
         .await;
 
@@ -1216,6 +1218,11 @@ async fn messages(
             Ok(resp) => resp,
             Err(e) => {
                 error!(error = %e, "Failed to connect to backend");
+                // Phase 3: kick supervisor on connect-failure.
+                let _ = state.probe_tx.try_send(crate::supervisor::ProbeKick {
+                    model_id: model.id.clone(),
+                    reason: crate::supervisor::ProbeReason::OnFailure,
+                });
                 return error_response(
                     StatusCode::BAD_GATEWAY,
                     "api_error",
@@ -1226,6 +1233,13 @@ async fn messages(
 
         if !backend_response.status().is_success() {
             let status = backend_response.status();
+            // Phase 3: kick supervisor on 5xx response from backend.
+            if status.is_server_error() {
+                let _ = state.probe_tx.try_send(crate::supervisor::ProbeKick {
+                    model_id: model.id.clone(),
+                    reason: crate::supervisor::ProbeReason::OnFailure,
+                });
+            }
             let error_body = backend_response
                 .text()
                 .await

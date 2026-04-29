@@ -67,6 +67,7 @@ fn test_config() -> AppConfig {
 
 async fn test_app_state() -> Arc<AppState> {
     let db = Database::test_db().await;
+    let (probe_tx, _probe_rx) = crate::supervisor::channel();
     Arc::new(AppState {
         config: test_config(),
         db,
@@ -74,6 +75,8 @@ async fn test_app_state() -> Arc<AppState> {
         scheduler: Scheduler::new(),
         metrics: MetricsBroadcaster::new(),
         reservations: ReservationBroadcaster::new(),
+        supervisor_map: std::sync::Arc::new(dashmap::DashMap::new()),
+        probe_tx,
     })
 }
 

@@ -334,6 +334,13 @@ pub async fn start_container_core(
                 .execute(&state.db.pool)
                 .await;
 
+            // Phase 6: a manual restart doubles as un-quarantine. Per
+            // decision 4 (note 019dd7f3-…, 2026-04-29), anyone with
+            // permission to start a model can rescue a quarantined one —
+            // no dedicated unquarantine endpoint. The UPDATE on a
+            // non-quarantined row is a no-op, so we don't gate on a SELECT.
+            clear_quarantine(state, &model_id).await;
+
             let url = state
                 .docker
                 .backend_base_url(&model_id, backend_type)
@@ -494,6 +501,28 @@ pub(crate) async fn reconcile_dead_backend_with_capture(
             model = %model_id,
             error = %e,
             "reconcile_dead_backend_with_capture: failed to write crash log row",
+        );
+    }
+}
+
+/// Clear quarantine state for a model (Phase 6).
+///
+/// A successful manual restart via `start_container_core` is the un-quarantine
+/// signal — we don't ship a dedicated `POST .../unquarantine` endpoint
+/// (decision 4). Best-effort: a DB failure is logged and swallowed since the
+/// container is already starting.
+pub(crate) async fn clear_quarantine(state: &Arc<AppState>, model_id: &str) {
+    if let Err(e) = sqlx::query(
+        "UPDATE models SET quarantined_at = NULL, quarantine_reason = NULL WHERE id = ?",
+    )
+    .bind(model_id)
+    .execute(&state.db.pool)
+    .await
+    {
+        error!(
+            model = %model_id,
+            error = %e,
+            "clear_quarantine: failed to clear quarantine columns",
         );
     }
 }
@@ -1013,6 +1042,75 @@ mod tests {
             row.5.as_deref(),
             Some("/config/crash_logs/m-capture-1714377600.log")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // clear_quarantine (Phase 6)
+    //
+    // A successful manual restart via start_container_core's success branch
+    // calls clear_quarantine — the Start button doubles as un-quarantine.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn clear_quarantine_clears_columns_when_set() {
+        let state = build_test_state().await;
+        let model_id = "m-clear-quar";
+
+        // Pre-populate model with quarantine state set.
+        sqlx::query(
+            "INSERT INTO models (id, hf_repo, filename, backend_type, loaded, runtime_overrides, quarantined_at, quarantine_reason) \
+             VALUES (?, ?, ?, 'llamacpp', 0, '{}', ?, ?)",
+        )
+        .bind(model_id)
+        .bind("owner/repo")
+        .bind("model.gguf")
+        .bind("2026-04-29T12:00:00Z")
+        .bind("test reason")
+        .execute(&state.db.pool)
+        .await
+        .expect("insert model");
+
+        super::clear_quarantine(&state, model_id).await;
+
+        let row: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT quarantined_at, quarantine_reason FROM models WHERE id = ?",
+        )
+        .bind(model_id)
+        .fetch_one(&state.db.pool)
+        .await
+        .expect("query");
+        assert!(row.0.is_none(), "quarantined_at should be cleared");
+        assert!(row.1.is_none(), "quarantine_reason should be cleared");
+    }
+
+    #[tokio::test]
+    async fn clear_quarantine_is_noop_for_unquarantined_model() {
+        let state = build_test_state().await;
+        let model_id = "m-not-quar";
+
+        sqlx::query(
+            "INSERT INTO models (id, hf_repo, filename, backend_type, loaded, runtime_overrides) \
+             VALUES (?, ?, ?, 'llamacpp', 0, '{}')",
+        )
+        .bind(model_id)
+        .bind("owner/repo")
+        .bind("model.gguf")
+        .execute(&state.db.pool)
+        .await
+        .expect("insert model");
+
+        super::clear_quarantine(&state, model_id).await;
+
+        // Row still exists, columns still NULL.
+        let row: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT quarantined_at, quarantine_reason FROM models WHERE id = ?",
+        )
+        .bind(model_id)
+        .fetch_one(&state.db.pool)
+        .await
+        .expect("query");
+        assert!(row.0.is_none());
+        assert!(row.1.is_none());
     }
 
     #[tokio::test]

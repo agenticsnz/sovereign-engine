@@ -30,6 +30,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 pub mod capture;
+pub mod restart;
 // Re-export the Phase 5 capture types/functions at the supervisor module
 // root so callers can write `crate::supervisor::CrashCapture` etc. without
 // reaching into the submodule. The functions are also used directly via
@@ -38,6 +39,11 @@ pub mod capture;
 pub use capture::{
     capture_crash_state, gc_crash_logs, write_crash_log_file, CrashCapture, CRASH_LOGS_MAX_BYTES,
 };
+// Re-export Phase 6 helpers so `crate::supervisor::quarantine_model` /
+// `crate::supervisor::restart_after_crash` are reachable without an extra
+// path component, mirroring the capture re-exports.
+#[allow(unused_imports)]
+pub use restart::{quarantine_model, restart_after_crash};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -509,6 +515,43 @@ async fn handle_kick(state: &Arc<crate::AppState>, client: &reqwest::Client, kic
         .await;
         let crash_logs_dir = data_path.join("crash_logs");
         capture::gc_crash_logs(&crash_logs_dir, capture::CRASH_LOGS_MAX_BYTES).await;
+
+        // Phase 6: post-reconcile decision. Read the worked flag (memory-
+        // first, DB fallback) and either auto-restart or quarantine.
+        let worked = read_worked(state, &kick.model_id).await;
+        match restart::decide_post_crash(worked) {
+            restart::PostCrashAction::Restart => {
+                info!(
+                    model = %kick.model_id,
+                    "Backend crashed but had served a 2xx since current start — restarting",
+                );
+                match restart::restart_after_crash(state, &kick.model_id).await {
+                    Ok(()) => {
+                        info!(model = %kick.model_id, "Auto-restart succeeded");
+                    }
+                    Err(reason) => {
+                        warn!(
+                            model = %kick.model_id,
+                            %reason,
+                            "Auto-restart failed — quarantining",
+                        );
+                        restart::quarantine_model(state, &kick.model_id, &reason).await;
+                    }
+                }
+            }
+            restart::PostCrashAction::QuarantineNeverWorked => {
+                info!(
+                    model = %kick.model_id,
+                    "Backend crashed without ever serving a 2xx — quarantining",
+                );
+                restart::quarantine_model(
+                    state,
+                    &kick.model_id,
+                    "no successful response since start",
+                )
+                .await;
+            }
+        }
     }
 }
 
@@ -790,6 +833,69 @@ mod tests {
         let kick = rx.recv().await.expect("kick should arrive");
         assert_eq!(kick.model_id, "no-such-model");
         assert_eq!(kick.reason, ProbeReason::OnFailure);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6: post-crash decision wiring (read_worked + decide_post_crash).
+    //
+    // The handle_kick loop body itself needs a Docker stub to fully integ-
+    // test, but the decision branch is small and pure. We assert that the
+    // composition `read_worked → decide_post_crash` returns the expected
+    // PostCrashAction for both true/false worked states (DB and in-memory).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn worked_then_crashed_path_decides_restart() {
+        let state = build_test_state().await;
+        let model_id = "m-worked";
+
+        sqlx::query(
+            "INSERT INTO models (id, hf_repo, filename, backend_type, loaded, runtime_overrides, worked) \
+             VALUES (?, ?, ?, 'llamacpp', 1, '{}', 1)",
+        )
+        .bind(model_id)
+        .bind("owner/repo")
+        .bind("model.gguf")
+        .execute(&state.db.pool)
+        .await
+        .expect("insert");
+
+        // In-memory entry also says worked=true.
+        state
+            .worked_map
+            .insert(model_id.to_string(), std::sync::atomic::AtomicBool::new(true));
+
+        let worked = read_worked(&state, model_id).await;
+        assert!(worked, "read_worked should report true");
+        assert_eq!(
+            restart::decide_post_crash(worked),
+            restart::PostCrashAction::Restart,
+        );
+    }
+
+    #[tokio::test]
+    async fn never_worked_then_crashed_path_decides_quarantine() {
+        let state = build_test_state().await;
+        let model_id = "m-never";
+
+        sqlx::query(
+            "INSERT INTO models (id, hf_repo, filename, backend_type, loaded, runtime_overrides, worked) \
+             VALUES (?, ?, ?, 'llamacpp', 1, '{}', 0)",
+        )
+        .bind(model_id)
+        .bind("owner/repo")
+        .bind("model.gguf")
+        .execute(&state.db.pool)
+        .await
+        .expect("insert");
+
+        // No in-memory worked_map entry — read_worked falls back to DB.
+        let worked = read_worked(&state, model_id).await;
+        assert!(!worked, "read_worked should report false");
+        assert_eq!(
+            restart::decide_post_crash(worked),
+            restart::PostCrashAction::QuarantineNeverWorked,
+        );
     }
 
     // -----------------------------------------------------------------------

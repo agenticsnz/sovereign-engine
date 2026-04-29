@@ -57,6 +57,13 @@ pub struct AppState {
     /// fires a `ProbeKick` so the supervisor probes the backend immediately
     /// instead of waiting for the next 10s tick.
     pub probe_tx: tokio::sync::mpsc::Sender<supervisor::ProbeKick>,
+    /// Per-model "this backend has served at least one 2xx response since
+    /// its current container start" flag. False on container start, flipped
+    /// to true on the first 2xx from the hot path. The atomic store is the
+    /// hot-path cost; the DB write only fires on the false→true transition
+    /// (compare_exchange contract). Read order at crash: in-memory first,
+    /// fall back to `models.worked` column on cold-start.
+    pub worked_map: Arc<dashmap::DashMap<String, std::sync::atomic::AtomicBool>>,
 }
 
 #[tokio::main]
@@ -128,6 +135,7 @@ async fn main() -> Result<()> {
         reservations: reservations_broadcaster,
         supervisor_map: std::sync::Arc::new(dashmap::DashMap::new()),
         probe_tx,
+        worked_map: std::sync::Arc::new(dashmap::DashMap::new()),
     });
 
     // Recover concurrency gate state from DB. Each loaded model is probed via

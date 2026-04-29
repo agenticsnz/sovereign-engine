@@ -322,6 +322,18 @@ pub async fn start_container_core(
                 .execute(&state.db.pool)
                 .await;
 
+            // Phase 4: reset worked on container start. The new container
+            // hasn't served a 2xx yet — clear both halves of the hybrid
+            // (in-memory atomic + persisted DB column). The hot-path will
+            // flip them back to true on the first successful response.
+            state
+                .worked_map
+                .insert(model_id.clone(), std::sync::atomic::AtomicBool::new(false));
+            let _ = sqlx::query("UPDATE models SET worked = 0 WHERE id = ?")
+                .bind(&model_id)
+                .execute(&state.db.pool)
+                .await;
+
             let url = state
                 .docker
                 .backend_base_url(&model_id, backend_type)
@@ -393,7 +405,12 @@ pub(crate) async fn reconcile_dead_backend(
     // 2. Unregister the gate slot.
     state.scheduler.gate().unregister(model_id).await;
 
-    // 3. (Phase 4 hook: drop any in-memory supervisor state here.)
+    // 3. Drop the in-memory worked-flag entry (Phase 4). A crashed model has
+    //    no entry; the next container-start path re-inserts a `false` atomic.
+    //    The persisted `models.worked` column is intentionally left intact —
+    //    Phase 6's quarantine decision wants to know whether the *previous*
+    //    container instance ever served a 2xx, not just the live one.
+    state.worked_map.remove(model_id);
 
     // 4. Append a crash-log row.
     if let Err(e) = sqlx::query(
@@ -732,6 +749,7 @@ mod tests {
             reservations: crate::scheduler::reservation::ReservationBroadcaster::new(),
             supervisor_map: std::sync::Arc::new(dashmap::DashMap::new()),
             probe_tx,
+            worked_map: std::sync::Arc::new(dashmap::DashMap::new()),
         })
     }
 

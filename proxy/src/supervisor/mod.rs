@@ -215,6 +215,34 @@ pub fn transition(prev: &BackendState, outcome: ProbeOutcome) -> BackendState {
 }
 
 // ---------------------------------------------------------------------------
+// Worked-flag read helper (Phase 4)
+// ---------------------------------------------------------------------------
+
+/// Read the "has this backend served a 2xx since current start?" flag.
+///
+/// Memory-first: the in-memory atomic is the source of truth while a
+/// container is alive. Falls back to the `models.worked` DB column on a
+/// cold-start cache miss (i.e. the proxy restarted but the container kept
+/// running and the DashMap entry was lost).
+///
+/// Phase 4 only exposes the helper — Phase 6 wires it into the supervisor's
+/// `Crashed` branch to drive the quarantine decision.
+#[allow(dead_code)]
+pub async fn read_worked(state: &Arc<crate::AppState>, model_id: &str) -> bool {
+    if let Some(entry) = state.worked_map.get(model_id) {
+        return entry.load(std::sync::atomic::Ordering::SeqCst);
+    }
+    // Cold-start fallback: in-memory entry was lost (proxy restarted).
+    let row: Option<(i64,)> = sqlx::query_as("SELECT worked FROM models WHERE id = ?")
+        .bind(model_id)
+        .fetch_optional(&state.db.pool)
+        .await
+        .ok()
+        .flatten();
+    row.map(|(w,)| w != 0).unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
 // Probe classification
 // ---------------------------------------------------------------------------
 
@@ -778,6 +806,7 @@ mod tests {
                 let (tx, _rx) = mpsc::channel::<ProbeKick>(1);
                 tx
             },
+            worked_map: Arc::new(DashMap::new()),
         })
     }
 }

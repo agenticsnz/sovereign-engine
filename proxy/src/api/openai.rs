@@ -207,7 +207,7 @@ async fn proxy_completion(
         is_streaming,
         api_key.as_deref(),
         &model.id,
-        &state.probe_tx,
+        &state,
     )
     .await;
 

@@ -1143,7 +1143,7 @@ async fn messages(
             false,
             api_key.as_deref(),
             &model.id,
-            &state.probe_tx,
+            &state,
         )
         .await;
 
@@ -1230,6 +1230,15 @@ async fn messages(
                 );
             }
         };
+
+        // Phase 4 hot-path worked-flag flip — earliest 2xx signal mirrors
+        // the proxy_to_backend non-streaming path. Done before the
+        // success-check fallthrough so we hit the same earliest point.
+        crate::proxy::streaming::record_worked(
+            &state,
+            &model.id,
+            StatusCode::from_u16(backend_response.status().as_u16()).unwrap_or(StatusCode::OK),
+        );
 
         if !backend_response.status().is_success() {
             let status = backend_response.status();

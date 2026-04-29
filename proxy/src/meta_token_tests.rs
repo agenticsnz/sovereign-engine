@@ -85,6 +85,7 @@ async fn test_app_state() -> Arc<AppState> {
         reservations: ReservationBroadcaster::new(),
         supervisor_map: std::sync::Arc::new(dashmap::DashMap::new()),
         probe_tx,
+        worked_map: std::sync::Arc::new(dashmap::DashMap::new()),
     })
 }
 

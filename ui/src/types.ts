@@ -190,6 +190,14 @@ export interface AdminModel {
   n_kv_heads: number | null;
   embedding_length: number | null;
   runtime_overrides: RuntimeOverrides | null;
+  /**
+   * Phase 6/7 quarantine: ISO-8601 timestamp set when the supervisor flagged
+   * this model as no-auto-restart. `null` means not quarantined. Even when
+   * the container is gone (loaded=0), this column persists so the admin UI
+   * can still show the badge and prompt the operator to manually restart.
+   */
+  quarantined_at?: string | null;
+  quarantine_reason?: string | null;
 }
 
 // ---- Admin: Users ----
@@ -308,6 +316,27 @@ export interface SystemContainer {
   healthy: boolean;
   state: string;
   vram_used_mb: number | null;
+  // Phase 7: supervisor + crash diagnostics surfaced by the backend.
+  fsm_state?: 'Starting' | 'Healthy' | 'Suspect' | 'Crashed' | 'Quarantined';
+  quarantined?: boolean;
+  quarantine_reason?: string | null;
+  last_crash?: LastCrashSummary | null;
+}
+
+export interface LastCrashSummary {
+  occurred_at: string;
+  exit_code: number | null;
+  oom_killed: boolean;
+  log_path_present: boolean;
+}
+
+export interface CrashHistoryRow {
+  occurred_at: string;
+  container_id: string | null;
+  exit_code: number | null;
+  oom_killed: number; // 0 or 1, raw from sqlite
+  signal: string | null;
+  log_path_present: boolean;
 }
 
 // ---- Admin: Containers ----

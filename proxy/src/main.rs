@@ -149,11 +149,7 @@ async fn main() -> Result<()> {
     supervisor::spawn(state.clone(), probe_rx, alive_model_ids);
 
     // Start background metrics collection (broadcasts every 2s)
-    state.metrics.spawn_collector(
-        state.docker.clone(),
-        state.scheduler.clone(),
-        state.config.model_path.clone(),
-    );
+    state.metrics.spawn_collector(state.clone());
 
     // Recover active reservation from DB (if proxy restarted during a reservation)
     scheduler::reservation::recover_active_reservation(&state.db.pool, &state.scheduler).await;

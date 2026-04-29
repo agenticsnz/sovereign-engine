@@ -25,6 +25,7 @@ import type {
   Reservation,
   ReservationWithUser,
   CreateReservationRequest,
+  CrashHistoryRow,
 } from './types';
 
 export class ApiError extends Error {
@@ -357,6 +358,23 @@ export async function stopContainer(modelId: string): Promise<void> {
     method: 'POST',
     body: JSON.stringify({ model_id: modelId }),
   });
+}
+
+// ---- Admin: backend crash diagnostics (Phase 7) ----
+
+export async function getCrashHistory(modelId: string): Promise<CrashHistoryRow[]> {
+  const data = await request<{ history: CrashHistoryRow[] }>(
+    `/api/admin/models/${encodeURIComponent(modelId)}/crash_history`,
+  );
+  return data.history;
+}
+
+/**
+ * URL for the captured crash-log tail. Use as an `<a target="_blank">` href —
+ * the response is `text/plain`.
+ */
+export function crashLogUrl(modelId: string, occurredAt: string): string {
+  return `/api/admin/models/${encodeURIComponent(modelId)}/crash_log/${encodeURIComponent(occurredAt)}`;
 }
 
 // ---- User: Reservations ----

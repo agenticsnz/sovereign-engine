@@ -48,6 +48,12 @@ pub fn routes(state: Arc<AppState>) -> Router {
         .route("/models", get(list_models))
         .route("/models/register", post(register_model))
         .route("/models/{id}", put(update_model).delete(delete_model))
+        // Phase 7: backend crash diagnostics
+        .route("/models/{id}/crash_history", get(get_crash_history))
+        .route(
+            "/models/{id}/crash_log/{occurred_at}",
+            get(get_crash_log),
+        )
         // User management
         .route("/users", get(list_users))
         .route("/users/{id}", put(update_user))
@@ -882,9 +888,13 @@ async fn system_status(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     // Per-container VRAM (best-effort)
     let vram_map = state.docker.per_container_vram().await;
 
-    // Container health — list managed containers and check their state
+    // Container health — list managed containers and check their state.
+    // Phase 7: enriched variant adds supervisor FSM state, quarantine flag,
+    // and the most-recent crash summary for each managed container.
     let containers = match state.docker.list_managed_containers().await {
-        Ok(containers) => common::extract_container_statuses(containers, &vram_map),
+        Ok(containers) => {
+            common::extract_container_statuses_enriched(&state, containers, &vram_map).await
+        }
         Err(_) => vec![],
     };
 
@@ -1400,6 +1410,138 @@ fn estimate_kv_cache_mb(p: &KvCacheParams) -> u64 {
             kv_bytes / (1024 * 1024)
         }
         _ => 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7: backend crash diagnostics
+// ---------------------------------------------------------------------------
+
+/// One row of the crash history list, returned by
+/// `GET /api/admin/models/:id/crash_history`.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+struct CrashHistoryRow {
+    occurred_at: String,
+    container_id: Option<String>,
+    exit_code: Option<i64>,
+    oom_killed: i64,
+    signal: Option<String>,
+    /// Indicates that the on-disk log tail file may still be available —
+    /// callers should still defensively handle a 404 from
+    /// `GET /api/admin/models/:id/crash_log/:occurred_at` because the
+    /// inline GC may have evicted the file in the meantime.
+    log_path_present: bool,
+}
+
+/// `GET /api/admin/models/:id/crash_history` — last 5 crash events.
+///
+/// Used by the admin UI to render an expandable per-model crash panel
+/// (timestamp, exit code, OOMKilled flag, link to the captured log tail).
+async fn get_crash_history(
+    State(state): State<Arc<AppState>>,
+    Path(model_id): Path<String>,
+) -> impl IntoResponse {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        occurred_at: String,
+        container_id: Option<String>,
+        exit_code: Option<i64>,
+        oom_killed: i64,
+        signal: Option<String>,
+        log_path: Option<String>,
+    }
+
+    match sqlx::query_as::<_, Row>(
+        "SELECT occurred_at, container_id, exit_code, oom_killed, signal, log_path \
+         FROM backend_crash_log WHERE model_id = ? \
+         ORDER BY occurred_at DESC LIMIT 5",
+    )
+    .bind(&model_id)
+    .fetch_all(&state.db.pool)
+    .await
+    {
+        Ok(rows) => {
+            let history: Vec<CrashHistoryRow> = rows
+                .into_iter()
+                .map(|r| CrashHistoryRow {
+                    occurred_at: r.occurred_at,
+                    container_id: r.container_id,
+                    exit_code: r.exit_code,
+                    oom_killed: r.oom_killed,
+                    signal: r.signal,
+                    log_path_present: r.log_path.is_some(),
+                })
+                .collect();
+            Json(serde_json::json!({ "history": history })).into_response()
+        }
+        Err(e) => error::internal_error("crash_history", e),
+    }
+}
+
+/// `GET /api/admin/models/:id/crash_log/:occurred_at` — stream a captured log tail.
+///
+/// Returns the bytes of the on-disk log tail file as `text/plain; charset=utf-8`.
+/// 404 if no row matches, the row had no `log_path`, or the file has been GC'd.
+async fn get_crash_log(
+    State(state): State<Arc<AppState>>,
+    Path((model_id, occurred_at)): Path<(String, String)>,
+) -> axum::response::Response {
+    // 1. Look up the row.
+    let row: Option<(Option<String>,)> = match sqlx::query_as(
+        "SELECT log_path FROM backend_crash_log WHERE model_id = ? AND occurred_at = ?",
+    )
+    .bind(&model_id)
+    .bind(&occurred_at)
+    .fetch_optional(&state.db.pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return error::internal_error("crash_log:lookup", e),
+    };
+
+    let log_path = match row {
+        Some((Some(p),)) => p,
+        Some((None,)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "log was not captured" })),
+            )
+                .into_response();
+        }
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "crash log not found" })),
+            )
+                .into_response();
+        }
+    };
+
+    // 2. Read the file. Crash logs are capped (last ~500 lines) so a
+    //    full read into memory is fine — far simpler than streaming.
+    match tokio::fs::read(&log_path).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => {
+            // File missing (likely GC'd) is the common case here — log at
+            // debug, not error, so production logs aren't noisy.
+            tracing::debug!(
+                model = %model_id,
+                occurred_at = %occurred_at,
+                path = %log_path,
+                error = %e,
+                "crash_log: file no longer available",
+            );
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "log file no longer available" })),
+            )
+                .into_response()
+        }
     }
 }
 

@@ -8,7 +8,6 @@ use crate::api::hf::{get_disk_usage, DiskUsage};
 use crate::docker::DockerManager;
 use crate::scheduler::gate::GateSnapshot;
 use crate::scheduler::queue::QueueStats;
-use crate::scheduler::Scheduler;
 
 // ---- CPU sampling (Linux /proc/stat) ----
 
@@ -132,6 +131,38 @@ pub struct ContainerStatus {
     pub healthy: bool,
     pub state: Option<String>,
     pub vram_used_mb: Option<u64>,
+    // Phase 7: supervisor + crash diagnostics surfaced to the admin UI.
+    /// FSM state from the supervisor (None for non-llamacpp containers or
+    /// containers without a supervisor_map entry yet). Serialised as one of
+    /// `"Starting" | "Healthy" | "Suspect" | "Crashed" | "Quarantined"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fsm_state: Option<String>,
+    /// Whether `models.quarantined_at IS NOT NULL`.
+    #[serde(default)]
+    pub quarantined: bool,
+    /// Reason from `models.quarantine_reason`, if quarantined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantine_reason: Option<String>,
+    /// Most-recent `backend_crash_log` row for this model, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_crash: Option<LastCrashSummary>,
+}
+
+/// Summary of the most-recent crash event for a backend.
+///
+/// Surfaced via `extract_container_statuses_enriched` so the admin UI can
+/// flag a one-line "last crashed at …, exit 137, OOM" per model without an
+/// extra round-trip. Full history is fetched on demand via
+/// `GET /api/admin/models/:id/crash_history`.
+#[derive(Debug, Clone, Serialize)]
+pub struct LastCrashSummary {
+    pub occurred_at: String,
+    pub exit_code: Option<i64>,
+    pub oom_killed: bool,
+    /// True iff `backend_crash_log.log_path` is non-NULL — i.e. a tail was
+    /// captured. The UI uses this to gate the "view log" link; a 404 is
+    /// still possible if the file has since been GC'd.
+    pub log_path_present: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -169,7 +200,12 @@ impl MetricsBroadcaster {
     }
 
     /// Spawn the background collector task. Call once after AppState is built.
-    pub fn spawn_collector(&self, docker: DockerManager, scheduler: Scheduler, model_path: String) {
+    ///
+    /// Phase 7: takes the full `AppState` Arc so the per-container status
+    /// merge can call [`crate::api::common::extract_container_statuses_enriched`]
+    /// — which surfaces supervisor FSM state, quarantine flags, and the
+    /// most-recent crash summary into the SSE feed the admin UI consumes.
+    pub fn spawn_collector(&self, state: std::sync::Arc<crate::AppState>) {
         let tx = self.tx.clone();
 
         tokio::spawn(async move {
@@ -180,8 +216,7 @@ impl MetricsBroadcaster {
             loop {
                 interval.tick().await;
 
-                let snapshot =
-                    collect_snapshot(&docker, &scheduler, &model_path, &mut cpu_sampler).await;
+                let snapshot = collect_snapshot(&state, &mut cpu_sampler).await;
 
                 // If nobody is listening, send() returns Err — that's fine.
                 let _ = tx.send(snapshot);
@@ -191,11 +226,13 @@ impl MetricsBroadcaster {
 }
 
 async fn collect_snapshot(
-    docker: &DockerManager,
-    scheduler: &Scheduler,
-    model_path: &str,
+    state: &std::sync::Arc<crate::AppState>,
     cpu_sampler: &mut CpuSampler,
 ) -> MetricsSnapshot {
+    let docker = &state.docker;
+    let scheduler = &state.scheduler;
+    let model_path = state.config.model_path.as_str();
+
     // GPU stats (memory + utilization) — all detected GPUs
     let gpu_memory: Vec<GpuMemoryInfo> = DockerManager::gpu_all_info()
         .await
@@ -216,9 +253,13 @@ async fn collect_snapshot(
     // Per-container VRAM (best-effort, requires pid:host)
     let vram_map = docker.per_container_vram().await;
 
-    // Container statuses
+    // Container statuses (Phase 7 enriched: supervisor FSM + quarantine +
+    // last_crash). The SSE snapshot is what the admin UI reads live, so the
+    // enriched variant must run here too — not just on the REST endpoint.
     let containers = match docker.list_managed_containers().await {
-        Ok(list) => crate::api::common::extract_container_statuses(list, &vram_map),
+        Ok(list) => {
+            crate::api::common::extract_container_statuses_enriched(state, list, &vram_map).await
+        }
         Err(e) => {
             warn!(error = %e, "Failed to list containers for metrics");
             vec![]

@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-04-29
+
+### Added
+- **Backend supervisor:** automatic detection, capture, and recovery for crashed
+  llama.cpp backend containers. A 10s tick task probes every loaded backend's
+  `/health` endpoint; the proxy hot path also kicks the supervisor on any
+  non-2xx outcome (connect failure or 5xx response) for immediate diagnosis.
+- **Lifecycle FSM:** `Starting → Healthy → Suspect → Crashed → Quarantined`
+  with per-model state tracked in memory. 5-min startup grace for new
+  containers; 2 consecutive failures → `Crashed`.
+- **Crash diagnostics:** before any container removal, exit code, OOMKilled
+  flag, finished_at, and the last 500 log lines are captured. Log tails are
+  written to `data/crash_logs/<model_id>-<unix_ts>.log` and indexed in a new
+  `backend_crash_log` table. The crash-logs directory is GC'd inline to a
+  1 GiB cap by oldest-mtime eviction.
+- **Quarantine policy:** a backend that crashes without ever serving a
+  successful response is quarantined (no auto-restart). A backend that
+  served at least one 2xx response since its current container start is
+  auto-restarted from persisted state — UID, api_key, gpu_type, gpu_layers,
+  and parallel are reused so existing client sessions stay valid.
+  Manual unquarantine = clicking the existing Start button (no separate
+  endpoint or permission).
+- **Admin UI:** per-model status badge expanded to
+  `Loading | Healthy | Unhealthy | Crashed | Quarantined`. Crash history
+  panel showing the last 5 events per model with timestamps, exit codes,
+  OOMKilled flags, and links to view captured log tails (404 gracefully
+  when GC'd).
+- **`worked` flag:** new `models.worked` column tracks whether a backend
+  instance has served any 2xx response. In-memory atomic on the hot path
+  (one DB write per container start), DB column survives proxy restart.
+
+### Changed
+- `models.runtime_overrides` JSON shape now wrapped: `{cli: {...}, launch:
+  {gpu_type, gpu_layers, parallel}}`. Legacy bare-shape blobs parse with
+  backward compat. The `launch` sub-struct is what makes auto-restart
+  possible — the supervisor cannot restart models with empty `launch`
+  fields (e.g. containers started before this release); operator must
+  manually restart them once post-deploy to populate the field.
+- `recover_gate_state` now inspects each loaded model's container on
+  proxy startup. If the container is gone, state is reconciled
+  (`loaded=0`, gate not registered, basic crash row written) instead of
+  re-registering a phantom gate slot.
+
+### Migration notes
+- Migration `20260429000000_supervisor_schema.sql` adds the new columns
+  and `backend_crash_log` table. Forward-only; downgrade requires a
+  hand-rolled DROP migration.
+- On first deploy, currently-loaded backends will lack the `runtime_overrides.launch` sub-struct and will be skipped by auto-restart until manually
+  restarted via the admin UI. The supervisor logs each skip.
+
 ## [1.6.1] - 2026-04-27
 
 ### Fixed

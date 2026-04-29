@@ -16,7 +16,8 @@ use crate::db::models::{Model, ModelCategory};
 use crate::docker::runtime_overrides::{
     ModelRuntimeOverrides, PersistedLaunchConfig, WrappedRuntimeJson,
 };
-use crate::metrics::ContainerStatus;
+use crate::metrics::{ContainerStatus, LastCrashSummary};
+use crate::supervisor::BackendFsmState;
 use crate::AppState;
 
 // ---------------------------------------------------------------------------
@@ -67,7 +68,7 @@ pub async fn fetch_all_categories(pool: &SqlitePool) -> impl IntoResponse {
 /// Fetch all registered models. Used by both admin and user list endpoints.
 pub async fn fetch_all_models(pool: &SqlitePool) -> impl IntoResponse {
     match sqlx::query_as::<_, Model>(
-        "SELECT id, hf_repo, filename, size_bytes, category_id, loaded, backend_port, backend_type, last_used_at, created_at, context_length, n_layers, n_heads, n_kv_heads, embedding_length, key_length, value_length, sliding_window, kv_bytes_per_token_global, kv_bytes_per_token_swa, mmproj_filename, runtime_overrides FROM models",
+        "SELECT id, hf_repo, filename, size_bytes, category_id, loaded, backend_port, backend_type, last_used_at, created_at, context_length, n_layers, n_heads, n_kv_heads, embedding_length, key_length, value_length, sliding_window, kv_bytes_per_token_global, kv_bytes_per_token_swa, mmproj_filename, runtime_overrides, quarantined_at, quarantine_reason FROM models",
     )
     .fetch_all(pool)
     .await
@@ -107,9 +108,113 @@ pub fn extract_container_statuses(
                 healthy,
                 state: c.state.map(|s| format!("{:?}", s).to_lowercase()),
                 vram_used_mb,
+                // Phase 7: enriched fields are populated by
+                // `extract_container_statuses_enriched`. The pure helper
+                // leaves them at their None/false defaults.
+                fsm_state: None,
+                quarantined: false,
+                quarantine_reason: None,
+                last_crash: None,
             }
         })
         .collect()
+}
+
+/// Pretty name for an [`BackendFsmState`] — what the UI renders in the badge.
+fn fsm_state_label(s: BackendFsmState) -> &'static str {
+    match s {
+        BackendFsmState::Starting => "Starting",
+        BackendFsmState::Healthy => "Healthy",
+        BackendFsmState::Suspect => "Suspect",
+        BackendFsmState::Crashed => "Crashed",
+        BackendFsmState::Quarantined => "Quarantined",
+    }
+}
+
+/// Phase 7 enriched variant of [`extract_container_statuses`].
+///
+/// Adds the supervisor FSM label, quarantine flag/reason, and a one-line
+/// summary of the most-recent crash event. One DB round-trip per model
+/// (acceptable for an admin page; max ~tens of models per box).
+///
+/// Implemented as a wrapper around the pure helper so the existing test
+/// suite stays intact and the sync version remains usable from contexts
+/// without DB access (none today, but keep the option open).
+pub async fn extract_container_statuses_enriched(
+    state: &Arc<AppState>,
+    containers: Vec<bollard::models::ContainerSummary>,
+    vram_map: &std::collections::HashMap<String, u64>,
+) -> Vec<ContainerStatus> {
+    let mut base = extract_container_statuses(containers, vram_map);
+
+    for status in base.iter_mut() {
+        if status.model_id.is_empty() {
+            continue;
+        }
+
+        // FSM state — direct read from the in-memory supervisor map. No
+        // DB cost.
+        if let Some(entry) = state.supervisor_map.get(&status.model_id) {
+            status.fsm_state = Some(fsm_state_label(entry.fsm).to_string());
+        }
+
+        // Quarantine columns. Best-effort; on DB error we leave defaults
+        // and log so the page still renders.
+        match sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT quarantined_at, quarantine_reason FROM models WHERE id = ?",
+        )
+        .bind(&status.model_id)
+        .fetch_optional(&state.db.pool)
+        .await
+        {
+            Ok(Some((quar_at, quar_reason))) => {
+                status.quarantined = quar_at.is_some();
+                status.quarantine_reason = quar_reason;
+            }
+            Ok(None) => {
+                // Container exists but no models row — leave defaults.
+            }
+            Err(e) => {
+                error!(
+                    model = %status.model_id,
+                    error = %e,
+                    "extract_container_statuses_enriched: failed to read quarantine columns",
+                );
+            }
+        }
+
+        // Most-recent crash row.
+        match sqlx::query_as::<_, (String, Option<i64>, i64, Option<String>)>(
+            "SELECT occurred_at, exit_code, oom_killed, log_path \
+             FROM backend_crash_log WHERE model_id = ? \
+             ORDER BY occurred_at DESC LIMIT 1",
+        )
+        .bind(&status.model_id)
+        .fetch_optional(&state.db.pool)
+        .await
+        {
+            Ok(Some((occurred_at, exit_code, oom_killed, log_path))) => {
+                status.last_crash = Some(LastCrashSummary {
+                    occurred_at,
+                    exit_code,
+                    oom_killed: oom_killed != 0,
+                    log_path_present: log_path.is_some(),
+                });
+            }
+            Ok(None) => {
+                // No crash history yet — leave None.
+            }
+            Err(e) => {
+                error!(
+                    model = %status.model_id,
+                    error = %e,
+                    "extract_container_statuses_enriched: failed to read last crash",
+                );
+            }
+        }
+    }
+
+    base
 }
 
 // ---------------------------------------------------------------------------
@@ -676,6 +781,11 @@ mod tests {
         assert!(statuses[0].healthy);
         assert_eq!(statuses[0].state.as_deref(), Some("running"));
         assert_eq!(statuses[0].vram_used_mb, Some(4096));
+        // Phase 7: pure helper leaves enriched fields at defaults.
+        assert!(statuses[0].fsm_state.is_none());
+        assert!(!statuses[0].quarantined);
+        assert!(statuses[0].quarantine_reason.is_none());
+        assert!(statuses[0].last_crash.is_none());
     }
 
     #[test]
@@ -1159,5 +1269,133 @@ mod tests {
         assert_eq!(row.0.as_deref(), Some("supervisor_probe_failure"));
         assert_eq!(row.1, 0);
         assert!(row.2.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_container_statuses_enriched (Phase 7)
+    //
+    // Verifies the enriched wrapper merges supervisor_map FSM state, models
+    // quarantine columns, and the most-recent backend_crash_log row into the
+    // base ContainerStatus.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn extract_container_statuses_enriched_populates_fsm_quarantine_and_last_crash() {
+        let state = build_test_state().await;
+        let model_id = "m-enriched";
+
+        // Seed the model row, quarantined.
+        sqlx::query(
+            "INSERT INTO models (id, hf_repo, filename, backend_type, loaded, runtime_overrides, quarantined_at, quarantine_reason) \
+             VALUES (?, ?, ?, 'llamacpp', 1, '{}', ?, ?)",
+        )
+        .bind(model_id)
+        .bind("owner/repo")
+        .bind("model.gguf")
+        .bind("2026-04-29T11:00:00Z")
+        .bind("test quarantine")
+        .execute(&state.db.pool)
+        .await
+        .expect("insert model");
+
+        // Two crash rows — the most recent should win.
+        sqlx::query(
+            "INSERT INTO backend_crash_log (model_id, occurred_at, exit_code, oom_killed, signal, log_path) \
+             VALUES (?, '2026-04-29T10:00:00Z', 1, 0, 'older', NULL)",
+        )
+        .bind(model_id)
+        .execute(&state.db.pool)
+        .await
+        .expect("older crash row");
+
+        sqlx::query(
+            "INSERT INTO backend_crash_log (model_id, occurred_at, exit_code, oom_killed, signal, log_path) \
+             VALUES (?, '2026-04-29T11:00:00Z', 137, 1, 'OOMKilled', '/x/y.log')",
+        )
+        .bind(model_id)
+        .execute(&state.db.pool)
+        .await
+        .expect("newer crash row");
+
+        // Plant an FSM state in the supervisor map.
+        state.supervisor_map.insert(
+            model_id.to_string(),
+            crate::supervisor::BackendState {
+                fsm: crate::supervisor::BackendFsmState::Crashed,
+                consecutive_failures: 2,
+                started_at: std::time::Instant::now(),
+            },
+        );
+
+        // Build a fake container summary that matches.
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(
+            "sovereign-engine.model-id".to_string(),
+            model_id.to_string(),
+        );
+        let containers = vec![bollard::models::ContainerSummary {
+            labels: Some(labels),
+            state: Some(bollard::models::ContainerSummaryStateEnum::EXITED),
+            ..Default::default()
+        }];
+
+        let result = super::extract_container_statuses_enriched(
+            &state,
+            containers,
+            &std::collections::HashMap::new(),
+        )
+        .await;
+
+        assert_eq!(result.len(), 1);
+        let s = &result[0];
+        assert_eq!(s.model_id, model_id);
+        assert_eq!(s.fsm_state.as_deref(), Some("Crashed"));
+        assert!(s.quarantined);
+        assert_eq!(s.quarantine_reason.as_deref(), Some("test quarantine"));
+        let last = s.last_crash.as_ref().expect("last_crash present");
+        assert_eq!(last.occurred_at, "2026-04-29T11:00:00Z");
+        assert_eq!(last.exit_code, Some(137));
+        assert!(last.oom_killed);
+        assert!(last.log_path_present);
+    }
+
+    #[tokio::test]
+    async fn extract_container_statuses_enriched_leaves_defaults_when_no_data() {
+        let state = build_test_state().await;
+        let model_id = "m-bare";
+
+        sqlx::query(
+            "INSERT INTO models (id, hf_repo, filename, backend_type, loaded, runtime_overrides) \
+             VALUES (?, ?, ?, 'llamacpp', 1, '{}')",
+        )
+        .bind(model_id)
+        .bind("owner/repo")
+        .bind("model.gguf")
+        .execute(&state.db.pool)
+        .await
+        .expect("insert model");
+
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(
+            "sovereign-engine.model-id".to_string(),
+            model_id.to_string(),
+        );
+        let containers = vec![bollard::models::ContainerSummary {
+            labels: Some(labels),
+            state: Some(bollard::models::ContainerSummaryStateEnum::RUNNING),
+            ..Default::default()
+        }];
+
+        let result = super::extract_container_statuses_enriched(
+            &state,
+            containers,
+            &std::collections::HashMap::new(),
+        )
+        .await;
+
+        let s = &result[0];
+        assert!(s.fsm_state.is_none(), "no supervisor entry → no fsm_state");
+        assert!(!s.quarantined);
+        assert!(s.quarantine_reason.is_none());
+        assert!(s.last_crash.is_none());
     }
 }

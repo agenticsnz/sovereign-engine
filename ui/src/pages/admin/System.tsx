@@ -1,6 +1,23 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
-import { getSystemInfo, getAdminModels, stopContainer, deleteModel, ApiError, type BlockingToken } from '../../api';
-import type { SystemInfo, AdminModel, SystemContainer, GpuMemory, CpuInfo, GateSnapshot } from '../../types';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import {
+  getSystemInfo,
+  getAdminModels,
+  stopContainer,
+  deleteModel,
+  getCrashHistory,
+  crashLogUrl,
+  ApiError,
+  type BlockingToken,
+} from '../../api';
+import type {
+  SystemInfo,
+  AdminModel,
+  SystemContainer,
+  GpuMemory,
+  CpuInfo,
+  GateSnapshot,
+  CrashHistoryRow,
+} from '../../types';
 import { useTheme } from '../../theme';
 import { useEventStream, type ConnectionStatus } from '../../hooks/useEventStream';
 import LoadingSpinner from '../../components/common/LoadingSpinner';
@@ -52,6 +69,221 @@ function percentColor(percent: number, colors: { dangerText: string; warningText
   return colors.successText;
 }
 
+// Phase 7: 5-state status badge driven off supervisor FSM + quarantine flag.
+//
+// Decision 4 (note `019dd7f3-5917-72a2-99b0-e4dd52166f1c`): there is no
+// dedicated unquarantine endpoint — clicking Start clears the flag. The
+// badge therefore simply reports "Quarantined" so the operator knows what
+// state they're in; the Start button (rendered elsewhere in the row) does
+// the actual work.
+function StatusBadge({
+  container,
+  isLoaded,
+}: Readonly<{ container: SystemContainer | undefined; isLoaded: boolean }>) {
+  const { colors } = useTheme();
+  if (!isLoaded || !container) {
+    return <span style={{ color: colors.textMuted }}>-</span>;
+  }
+
+  let label: string;
+  let bg: string;
+  let fg: string;
+
+  if (container.quarantined) {
+    label = 'Quarantined';
+    bg = colors.badgeWarningBg;
+    fg = colors.badgeWarningText;
+  } else {
+    switch (container.fsm_state) {
+      case 'Starting':
+        label = 'Loading';
+        bg = colors.badgeNeutralBg;
+        fg = colors.badgeNeutralText;
+        break;
+      case 'Healthy':
+        label = 'Healthy';
+        bg = colors.badgeSuccessBg;
+        fg = colors.badgeSuccessText;
+        break;
+      case 'Suspect':
+        label = 'Unhealthy';
+        bg = colors.badgeWarningBg;
+        fg = colors.badgeWarningText;
+        break;
+      case 'Crashed':
+        label = 'Crashed';
+        bg = colors.badgeDangerBg;
+        fg = colors.badgeDangerText;
+        break;
+      case 'Quarantined':
+        // Defensive — handled above via container.quarantined, but keep
+        // this branch in case the supervisor advanced state but the
+        // models row column isn't yet visible.
+        label = 'Quarantined';
+        bg = colors.badgeWarningBg;
+        fg = colors.badgeWarningText;
+        break;
+      default:
+        // Fallback for non-llamacpp backends or pre-supervisor rows.
+        label = container.healthy ? 'Healthy' : container.state || 'Unhealthy';
+        bg = container.healthy ? colors.badgeSuccessBg : colors.badgeDangerBg;
+        fg = container.healthy ? colors.badgeSuccessText : colors.badgeDangerText;
+    }
+  }
+
+  return (
+    <span
+      data-testid="status-badge"
+      style={{
+        display: 'inline-block',
+        padding: '0.15rem 0.5rem',
+        borderRadius: 12,
+        fontSize: '0.75rem',
+        fontWeight: 600,
+        background: bg,
+        color: fg,
+      }}
+      title={container.quarantine_reason ?? undefined}
+    >
+      {label}
+    </span>
+  );
+}
+
+function formatTimestamp(s: string): string {
+  // Crash timestamps come from sqlite as ISO-8601-ish; render in local time.
+  try {
+    const d = new Date(s);
+    if (Number.isNaN(d.getTime())) return s;
+    return d.toLocaleString();
+  } catch {
+    return s;
+  }
+}
+
+function CrashHistoryPanel({
+  modelId,
+  onClose,
+}: Readonly<{ modelId: string; onClose: () => void }>) {
+  const { colors } = useTheme();
+  const [state, setState] = useState<{
+    rows: CrashHistoryRow[] | null;
+    loading: boolean;
+    error: string | null;
+  }>({ rows: null, loading: true, error: null });
+
+  useEffect(() => {
+    let cancelled = false;
+    getCrashHistory(modelId)
+      .then((data) => {
+        if (!cancelled) {
+          setState({ rows: data, loading: false, error: null });
+        }
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          setState({
+            rows: null,
+            loading: false,
+            error: err instanceof Error ? err.message : 'Failed to load crash history',
+          });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [modelId]);
+
+  const { rows, loading, error } = state;
+
+  return (
+    <tr data-testid="crash-history-panel">
+      <td colSpan={8} style={{ padding: '0.75rem 1rem', background: colors.cardBg }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
+          <strong style={{ fontSize: '0.85rem' }}>Crash history (last 5)</strong>
+          <button
+            onClick={onClose}
+            style={{
+              background: 'none',
+              border: 'none',
+              color: colors.textMuted,
+              cursor: 'pointer',
+              fontSize: '0.8rem',
+            }}
+          >
+            Close
+          </button>
+        </div>
+        {loading && <p style={{ color: colors.textMuted, margin: 0 }}>Loading...</p>}
+        {error && (
+          <p style={{ color: colors.dangerText, margin: 0 }} role="alert">
+            {error}
+          </p>
+        )}
+        {!loading && !error && rows && rows.length === 0 && (
+          <p style={{ color: colors.textMuted, margin: 0 }}>No crash events recorded.</p>
+        )}
+        {!loading && !error && rows && rows.length > 0 && (
+          <ul
+            data-testid="crash-history-list"
+            style={{
+              margin: 0,
+              padding: 0,
+              listStyle: 'none',
+              fontSize: '0.8rem',
+              fontFamily: 'monospace',
+            }}
+          >
+            {rows.map((row) => (
+              <li
+                key={row.occurred_at}
+                style={{
+                  padding: '0.25rem 0',
+                  borderBottom: `1px solid ${colors.tableRowBorder}`,
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.75rem',
+                }}
+              >
+                <span>{formatTimestamp(row.occurred_at)}</span>
+                <span>·</span>
+                <span>
+                  exit{' '}
+                  {row.exit_code !== null && row.exit_code !== undefined
+                    ? row.exit_code
+                    : '-'}
+                </span>
+                <span>·</span>
+                <span>OOM: {row.oom_killed ? 'yes' : 'no'}</span>
+                {row.signal && (
+                  <>
+                    <span>·</span>
+                    <span title={`signal: ${row.signal}`}>{row.signal}</span>
+                  </>
+                )}
+                <span style={{ marginLeft: 'auto' }}>
+                  {row.log_path_present ? (
+                    <a
+                      href={crashLogUrl(modelId, row.occurred_at)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={{ color: colors.successText }}
+                    >
+                      view log
+                    </a>
+                  ) : (
+                    <span style={{ color: colors.textMuted }}>log no longer available</span>
+                  )}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </td>
+    </tr>
+  );
+}
+
 export default function System() {
   const { colors } = useTheme();
   const [system, setSystem] = useState<SystemInfo | null>(null);
@@ -66,6 +298,8 @@ export default function System() {
     blockingTokens: BlockingToken[];
   } | null>(null);
   const [startModel, setStartModel] = useState<AdminModel | null>(null);
+  // Phase 7: which model has its crash-history panel expanded (single-open).
+  const [crashHistoryFor, setCrashHistoryFor] = useState<string | null>(null);
 
   // SSE live metrics
   const { snapshot, status: sseStatus } = useEventStream();
@@ -330,7 +564,8 @@ export default function System() {
                 const queue = queues[model.id];
 
                 return (
-                  <tr key={model.id} style={{ borderBottom: `1px solid ${colors.tableRowBorder}` }}>
+                  <React.Fragment key={model.id}>
+                  <tr style={{ borderBottom: `1px solid ${colors.tableRowBorder}` }}>
                     <td style={{ padding: '0.5rem' }}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', wordBreak: 'break-all' }}>
                         <span>{model.hf_repo}</span>
@@ -379,23 +614,32 @@ export default function System() {
                       )}
                     </td>
                     <td style={{ padding: '0.5rem' }}>
-                      {isLoaded ? (
-                        <span
-                          style={{
-                            display: 'inline-block',
-                            padding: '0.15rem 0.5rem',
-                            borderRadius: 12,
-                            fontSize: '0.75rem',
-                            fontWeight: 600,
-                            background: container.healthy ? colors.badgeSuccessBg : colors.badgeDangerBg,
-                            color: container.healthy ? colors.badgeSuccessText : colors.badgeDangerText,
-                          }}
-                        >
-                          {container.healthy ? 'Healthy' : container.state || 'Unhealthy'}
-                        </span>
-                      ) : (
-                        <span style={{ color: colors.textMuted }}>-</span>
-                      )}
+                      {(() => {
+                        // When a model is quarantined, the supervisor cleared
+                        // `loaded=0` and the container is gone — but the
+                        // models row still has quarantined_at set. Surface the
+                        // badge whether or not a container exists.
+                        if (!isLoaded && model.quarantined_at) {
+                          return (
+                            <span
+                              data-testid="status-badge"
+                              title={model.quarantine_reason ?? undefined}
+                              style={{
+                                display: 'inline-block',
+                                padding: '0.15rem 0.5rem',
+                                borderRadius: 12,
+                                fontSize: '0.75rem',
+                                fontWeight: 600,
+                                background: colors.badgeWarningBg,
+                                color: colors.badgeWarningText,
+                              }}
+                            >
+                              Quarantined
+                            </span>
+                          );
+                        }
+                        return <StatusBadge container={container} isLoaded={isLoaded} />;
+                      })()}
                     </td>
                     <td style={{ padding: '0.5rem', whiteSpace: 'nowrap' }}>
                       {gate ? (
@@ -423,10 +667,66 @@ export default function System() {
                       }
                     </td>
                     <td style={{ padding: '0.5rem', textAlign: 'right', whiteSpace: 'nowrap' }}>
-                      <div style={{ display: 'flex', gap: '0.35rem', justifyContent: 'flex-end' }}>
-                        {isLoaded ? (
+                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '0.25rem' }}>
+                        <div style={{ display: 'flex', gap: '0.35rem', justifyContent: 'flex-end', flexWrap: 'wrap' }}>
+                          {isLoaded ? (
+                            <button
+                              onClick={() => setConfirmStop(model.id)}
+                              disabled={busy}
+                              style={{
+                                padding: '0.25rem 0.6rem',
+                                background: colors.buttonDanger,
+                                color: '#fff',
+                                border: 'none',
+                                borderRadius: 6,
+                                cursor: busy ? 'default' : 'pointer',
+                                fontSize: '0.8rem',
+                                opacity: busy ? 0.5 : 1,
+                              }}
+                            >
+                              {busy ? 'Stopping...' : 'Stop'}
+                            </button>
+                          ) : (
+                            <button
+                              data-testid={model.quarantined_at ? 'restart-button' : 'start-button'}
+                              onClick={() => setStartModel(model)}
+                              disabled={busy}
+                              style={{
+                                padding: '0.25rem 0.6rem',
+                                background: colors.successText,
+                                color: '#fff',
+                                border: 'none',
+                                borderRadius: 6,
+                                cursor: busy ? 'default' : 'pointer',
+                                fontSize: '0.8rem',
+                                opacity: busy ? 0.5 : 1,
+                              }}
+                            >
+                              {(() => {
+                                if (busy) return 'Starting...';
+                                return model.quarantined_at ? 'Restart' : 'Start';
+                              })()}
+                            </button>
+                          )}
                           <button
-                            onClick={() => setConfirmStop(model.id)}
+                            data-testid="crash-history-toggle"
+                            onClick={() =>
+                              setCrashHistoryFor((cur) => (cur === model.id ? null : model.id))
+                            }
+                            style={{
+                              padding: '0.25rem 0.6rem',
+                              background: 'transparent',
+                              color: colors.textSecondary,
+                              border: `1px solid ${colors.cardBorder}`,
+                              borderRadius: 6,
+                              cursor: 'pointer',
+                              fontSize: '0.8rem',
+                            }}
+                          >
+                            {crashHistoryFor === model.id ? 'Hide history' : 'Crash history'}
+                          </button>
+                          <button
+                            onClick={() => setConfirmDelete(model)}
                             disabled={busy}
                             style={{
                               padding: '0.25rem 0.6rem',
@@ -439,45 +739,33 @@ export default function System() {
                               opacity: busy ? 0.5 : 1,
                             }}
                           >
-                            {busy ? 'Stopping...' : 'Stop'}
+                            Delete
                           </button>
-                        ) : (
-                          <button
-                            onClick={() => setStartModel(model)}
-                            disabled={busy}
+                        </div>
+                        {!isLoaded && model.quarantined_at && (
+                          <span
+                            data-testid="quarantine-note"
                             style={{
-                              padding: '0.25rem 0.6rem',
-                              background: colors.successText,
-                              color: '#fff',
-                              border: 'none',
-                              borderRadius: 6,
-                              cursor: busy ? 'default' : 'pointer',
-                              fontSize: '0.8rem',
-                              opacity: busy ? 0.5 : 1,
+                              fontSize: '0.7rem',
+                              color: colors.textMuted,
+                              maxWidth: 240,
+                              textAlign: 'right',
+                              lineHeight: 1.3,
                             }}
                           >
-                            {busy ? 'Starting...' : 'Start'}
-                          </button>
+                            Quarantined — clicking Restart will clear the quarantine flag and launch.
+                          </span>
                         )}
-                        <button
-                          onClick={() => setConfirmDelete(model)}
-                          disabled={busy}
-                          style={{
-                            padding: '0.25rem 0.6rem',
-                            background: colors.buttonDanger,
-                            color: '#fff',
-                            border: 'none',
-                            borderRadius: 6,
-                            cursor: busy ? 'default' : 'pointer',
-                            fontSize: '0.8rem',
-                            opacity: busy ? 0.5 : 1,
-                          }}
-                        >
-                          Delete
-                        </button>
                       </div>
                     </td>
                   </tr>
+                  {crashHistoryFor === model.id && (
+                    <CrashHistoryPanel
+                      modelId={model.id}
+                      onClose={() => setCrashHistoryFor(null)}
+                    />
+                  )}
+                  </React.Fragment>
                 );
               })}
             </tbody>

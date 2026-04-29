@@ -55,6 +55,13 @@ pub struct Model {
     /// object, not a string — see [`serialize_runtime_overrides`].
     #[serde(serialize_with = "serialize_runtime_overrides")]
     pub runtime_overrides: String,
+    /// Phase 6 quarantine: ISO-8601 timestamp when the supervisor quarantined
+    /// this backend (i.e. it crashed without ever serving a 2xx). `None`
+    /// means the model is not quarantined.
+    pub quarantined_at: Option<DateTime<Utc>>,
+    /// Phase 6 quarantine: human-readable reason set alongside
+    /// `quarantined_at`. `None` when not quarantined.
+    pub quarantine_reason: Option<String>,
 }
 
 /// Serialize the `runtime_overrides` JSON column as a nested object so the
@@ -129,6 +136,8 @@ mod tests {
             kv_bytes_per_token_swa: None,
             mmproj_filename: None,
             runtime_overrides: runtime_overrides.into(),
+            quarantined_at: None,
+            quarantine_reason: None,
         }
     }
 

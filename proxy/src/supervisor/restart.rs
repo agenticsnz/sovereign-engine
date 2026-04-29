@@ -18,8 +18,8 @@
 //! `start_container_core` clears `quarantined_at` / `quarantine_reason` as a
 //! side effect.
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Instant;
 
 use sqlx::FromRow;
@@ -274,14 +274,13 @@ pub async fn restart_after_crash(
 /// it to disk).
 pub async fn quarantine_model(state: &Arc<crate::AppState>, model_id: &str, reason: &str) {
     let now = chrono::Utc::now().to_rfc3339();
-    if let Err(e) = sqlx::query(
-        "UPDATE models SET quarantined_at = ?, quarantine_reason = ? WHERE id = ?",
-    )
-    .bind(&now)
-    .bind(reason)
-    .bind(model_id)
-    .execute(&state.db.pool)
-    .await
+    if let Err(e) =
+        sqlx::query("UPDATE models SET quarantined_at = ?, quarantine_reason = ? WHERE id = ?")
+            .bind(&now)
+            .bind(reason)
+            .bind(model_id)
+            .execute(&state.db.pool)
+            .await
     {
         error!(
             model = %model_id,
@@ -390,10 +389,7 @@ mod tests {
         assert_eq!(cfg.api_key, "preserved-api-key");
         assert!(matches!(cfg.gpu_type, GpuType::Vulkan));
         // CLI overrides flow through.
-        assert!(cfg
-            .extra_args
-            .iter()
-            .any(|s| s == "--cache-ram"));
+        assert!(cfg.extra_args.iter().any(|s| s == "--cache-ram"));
     }
 
     #[test]
@@ -547,18 +543,14 @@ mod tests {
 
         quarantine_model(&state, "m-quar", "no successful response since start").await;
 
-        let row: (Option<String>, Option<String>) = sqlx::query_as(
-            "SELECT quarantined_at, quarantine_reason FROM models WHERE id = ?",
-        )
-        .bind("m-quar")
-        .fetch_one(&state.db.pool)
-        .await
-        .expect("query");
+        let row: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT quarantined_at, quarantine_reason FROM models WHERE id = ?")
+                .bind("m-quar")
+                .fetch_one(&state.db.pool)
+                .await
+                .expect("query");
         assert!(row.0.is_some(), "quarantined_at should be set");
-        assert_eq!(
-            row.1.as_deref(),
-            Some("no successful response since start")
-        );
+        assert_eq!(row.1.as_deref(), Some("no successful response since start"));
     }
 
     #[tokio::test]
@@ -591,13 +583,12 @@ mod tests {
 
         quarantine_model(&state, "m-noentry", "reason").await;
 
-        let row: Option<String> = sqlx::query_scalar(
-            "SELECT quarantined_at FROM models WHERE id = ?",
-        )
-        .bind("m-noentry")
-        .fetch_one(&state.db.pool)
-        .await
-        .expect("query");
+        let row: Option<String> =
+            sqlx::query_scalar("SELECT quarantined_at FROM models WHERE id = ?")
+                .bind("m-noentry")
+                .fetch_one(&state.db.pool)
+                .await
+                .expect("query");
         assert!(row.is_some());
     }
 
@@ -615,10 +606,7 @@ mod tests {
         let err = restart_after_crash(&state, "no-such-model")
             .await
             .unwrap_err();
-        assert!(
-            err.contains("missing persisted state"),
-            "got: {err}"
-        );
+        assert!(err.contains("missing persisted state"), "got: {err}");
     }
 
     #[tokio::test]
@@ -629,10 +617,7 @@ mod tests {
         let err = restart_after_crash(&state, "m-no-secrets")
             .await
             .unwrap_err();
-        assert!(
-            err.contains("container_secrets row missing"),
-            "got: {err}"
-        );
+        assert!(err.contains("container_secrets row missing"), "got: {err}");
     }
 
     #[tokio::test]
@@ -664,20 +649,16 @@ mod tests {
         .expect("insert secrets");
 
         let err = restart_after_crash(&state, "m-legacy").await.unwrap_err();
-        assert!(
-            err.contains("legacy runtime_overrides"),
-            "got: {err}"
-        );
+        assert!(err.contains("legacy runtime_overrides"), "got: {err}");
 
         // restart_after_crash itself MUST NOT write the quarantine columns
         // (the supervisor wrapper does that on Err).
-        let row: (Option<String>, Option<String>) = sqlx::query_as(
-            "SELECT quarantined_at, quarantine_reason FROM models WHERE id = ?",
-        )
-        .bind("m-legacy")
-        .fetch_one(&state.db.pool)
-        .await
-        .expect("query");
+        let row: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT quarantined_at, quarantine_reason FROM models WHERE id = ?")
+                .bind("m-legacy")
+                .fetch_one(&state.db.pool)
+                .await
+                .expect("query");
         assert!(
             row.0.is_none(),
             "restart_after_crash must not set quarantined_at"

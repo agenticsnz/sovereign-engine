@@ -494,11 +494,7 @@ async fn recover_gate_state(state: &Arc<AppState>) -> Vec<String> {
 
         let (alive, container_id) = match &inspect_result {
             Ok(info) => {
-                let running = info
-                    .state
-                    .as_ref()
-                    .and_then(|s| s.running)
-                    .unwrap_or(false);
+                let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
                 (running, info.id.clone())
             }
             Err(_) => (false, None),
@@ -530,9 +526,7 @@ async fn recover_gate_state(state: &Arc<AppState>) -> Vec<String> {
 
     info!(
         total = rows.len(),
-        recovered,
-        reconciled,
-        "Gate state recovery complete",
+        recovered, reconciled, "Gate state recovery complete",
     );
 
     alive_ids

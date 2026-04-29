@@ -377,13 +377,12 @@ pub async fn start_container_core(
             };
             match new_wrapped.to_json() {
                 Ok(blob) => {
-                    if let Err(e) = sqlx::query(
-                        "UPDATE models SET runtime_overrides = ? WHERE id = ?",
-                    )
-                    .bind(&blob)
-                    .bind(&model_id)
-                    .execute(&state.db.pool)
-                    .await
+                    if let Err(e) =
+                        sqlx::query("UPDATE models SET runtime_overrides = ? WHERE id = ?")
+                            .bind(&blob)
+                            .bind(&model_id)
+                            .execute(&state.db.pool)
+                            .await
                     {
                         error!(
                             model = %model_id,
@@ -984,13 +983,8 @@ mod tests {
         assert!(snapshot_before.contains_key(model_id));
 
         // Act
-        super::reconcile_dead_backend(
-            &state,
-            model_id,
-            Some("container-id-abc"),
-            "test_reason",
-        )
-        .await;
+        super::reconcile_dead_backend(&state, model_id, Some("container-id-abc"), "test_reason")
+            .await;
 
         // Assert: loaded cleared.
         let loaded: i64 = sqlx::query_scalar("SELECT loaded FROM models WHERE id = ?")
@@ -1040,13 +1034,7 @@ mod tests {
         .expect("insert model");
 
         // No prior gate registration — reconcile must still be idempotent.
-        super::reconcile_dead_backend(
-            &state,
-            model_id,
-            None,
-            "discovered_at_proxy_startup",
-        )
-        .await;
+        super::reconcile_dead_backend(&state, model_id, None, "discovered_at_proxy_startup").await;
 
         let loaded: i64 = sqlx::query_scalar("SELECT loaded FROM models WHERE id = ?")
             .bind(model_id)
@@ -1055,13 +1043,12 @@ mod tests {
             .expect("query loaded");
         assert_eq!(loaded, 0);
 
-        let crash: (Option<String>, Option<String>) = sqlx::query_as(
-            "SELECT container_id, signal FROM backend_crash_log WHERE model_id = ?",
-        )
-        .bind(model_id)
-        .fetch_one(&state.db.pool)
-        .await
-        .expect("query crash log");
+        let crash: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT container_id, signal FROM backend_crash_log WHERE model_id = ?")
+                .bind(model_id)
+                .fetch_one(&state.db.pool)
+                .await
+                .expect("query crash log");
         assert!(crash.0.is_none(), "container_id should be NULL");
         assert_eq!(crash.1.as_deref(), Some("discovered_at_proxy_startup"));
     }
@@ -1103,8 +1090,7 @@ mod tests {
             signal: Some("OOMKilled".to_string()),
             log_tail: b"some log bytes".to_vec(),
         };
-        let log_path =
-            std::path::PathBuf::from("/config/crash_logs/m-capture-1714377600.log");
+        let log_path = std::path::PathBuf::from("/config/crash_logs/m-capture-1714377600.log");
 
         super::reconcile_dead_backend_with_capture(
             &state,
@@ -1182,13 +1168,12 @@ mod tests {
 
         super::clear_quarantine(&state, model_id).await;
 
-        let row: (Option<String>, Option<String>) = sqlx::query_as(
-            "SELECT quarantined_at, quarantine_reason FROM models WHERE id = ?",
-        )
-        .bind(model_id)
-        .fetch_one(&state.db.pool)
-        .await
-        .expect("query");
+        let row: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT quarantined_at, quarantine_reason FROM models WHERE id = ?")
+                .bind(model_id)
+                .fetch_one(&state.db.pool)
+                .await
+                .expect("query");
         assert!(row.0.is_none(), "quarantined_at should be cleared");
         assert!(row.1.is_none(), "quarantine_reason should be cleared");
     }
@@ -1212,13 +1197,12 @@ mod tests {
         super::clear_quarantine(&state, model_id).await;
 
         // Row still exists, columns still NULL.
-        let row: (Option<String>, Option<String>) = sqlx::query_as(
-            "SELECT quarantined_at, quarantine_reason FROM models WHERE id = ?",
-        )
-        .bind(model_id)
-        .fetch_one(&state.db.pool)
-        .await
-        .expect("query");
+        let row: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT quarantined_at, quarantine_reason FROM models WHERE id = ?")
+                .bind(model_id)
+                .fetch_one(&state.db.pool)
+                .await
+                .expect("query");
         assert!(row.0.is_none());
         assert!(row.1.is_none());
     }

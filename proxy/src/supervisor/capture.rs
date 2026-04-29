@@ -52,10 +52,7 @@ pub const CRASH_LOGS_MAX_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
 /// Returns `Default::default()` (with empty fields) on any bollard error —
 /// best-effort capture, never blocks reconciliation. All errors are logged
 /// at `warn` level.
-pub async fn capture_crash_state(
-    docker: &bollard::Docker,
-    container_name: &str,
-) -> CrashCapture {
+pub async fn capture_crash_state(docker: &bollard::Docker, container_name: &str) -> CrashCapture {
     let mut out = CrashCapture::default();
 
     // 1. Inspect — exit_code / oom_killed / finished_at / signal / id.

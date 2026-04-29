@@ -414,9 +414,7 @@ async fn handle_kick(state: &Arc<crate::AppState>, client: &reqwest::Client, kic
     // is gone, skip — reconcile will already have been called.
     let backend_type =
         crate::api::common::lookup_backend_type(&state.db.pool, &kick.model_id).await;
-    let base = state
-        .docker
-        .backend_base_url(&kick.model_id, &backend_type);
+    let base = state.docker.backend_base_url(&kick.model_id, &backend_type);
     let health_url = format!("{}/health", base.trim_end_matches('/'));
 
     // Probe transport / HTTP status.
@@ -435,11 +433,7 @@ async fn handle_kick(state: &Arc<crate::AppState>, client: &reqwest::Client, kic
             .await
         {
             Ok(info) => {
-                let running = info
-                    .state
-                    .as_ref()
-                    .and_then(|s| s.running)
-                    .unwrap_or(false);
+                let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
                 if !running {
                     outcome = ProbeOutcome::ContainerStopped;
                 }
@@ -488,11 +482,8 @@ async fn handle_kick(state: &Arc<crate::AppState>, client: &reqwest::Client, kic
         // gone forever. Phase 6 will add the restart call **after** this
         // capture/reconcile block; do not reorder.
         let container_name = format!("sovereign-llamacpp-{}", kick.model_id);
-        let crash_capture = capture::capture_crash_state(
-            &state.docker.docker,
-            &container_name,
-        )
-        .await;
+        let crash_capture =
+            capture::capture_crash_state(&state.docker.docker, &container_name).await;
         let unix_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -692,11 +683,7 @@ mod tests {
 
     #[test]
     fn transition_any_on_container_stopped_crashes_immediately() {
-        for prev in [
-            starting_state(),
-            healthy_state(),
-            suspect_state(1),
-        ] {
+        for prev in [starting_state(), healthy_state(), suspect_state(1)] {
             let next = transition(&prev, ProbeOutcome::ContainerStopped);
             assert_eq!(
                 next.fsm,
@@ -784,7 +771,11 @@ mod tests {
         // effect, not the tick task.
         let state = build_test_state().await;
         let (_, rx) = channel();
-        spawn(state.clone(), rx, vec!["foo".to_string(), "bar".to_string()]);
+        spawn(
+            state.clone(),
+            rx,
+            vec!["foo".to_string(), "bar".to_string()],
+        );
 
         let foo = state.supervisor_map.get("foo").expect("foo seeded");
         assert_eq!(foo.fsm, BackendFsmState::Healthy);
@@ -861,9 +852,10 @@ mod tests {
         .expect("insert");
 
         // In-memory entry also says worked=true.
-        state
-            .worked_map
-            .insert(model_id.to_string(), std::sync::atomic::AtomicBool::new(true));
+        state.worked_map.insert(
+            model_id.to_string(),
+            std::sync::atomic::AtomicBool::new(true),
+        );
 
         let worked = read_worked(&state, model_id).await;
         assert!(worked, "read_worked should report true");

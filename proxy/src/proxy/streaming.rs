@@ -129,7 +129,11 @@ pub async fn proxy_to_backend(
 
     // Phase 4 hot-path worked-flag flip — runs before the streaming/non-streaming
     // split so both response shapes flip on the same earliest signal.
-    record_worked(state, model_id, axum::http::StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK));
+    record_worked(
+        state,
+        model_id,
+        axum::http::StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK),
+    );
 
     // 5xx response kick — supervisor probes immediately.
     if status.is_server_error() {
@@ -489,13 +493,8 @@ mod tests {
             .insert(model_id.to_string(), AtomicBool::new(true));
         assert!(state.worked_map.get(model_id).is_some());
 
-        crate::api::common::reconcile_dead_backend(
-            &state,
-            model_id,
-            None,
-            "test_drop_worked",
-        )
-        .await;
+        crate::api::common::reconcile_dead_backend(&state, model_id, None, "test_drop_worked")
+            .await;
 
         assert!(
             state.worked_map.get(model_id).is_none(),

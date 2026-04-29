@@ -423,8 +423,7 @@ mod wrapped_tests {
         // Legacy on-disk blob: bare ModelRuntimeOverrides shape.
         // Wrapped parse fails (unknown field "cache_ram_mib" at top level),
         // we fall through to bare parse.
-        let parsed =
-            WrappedRuntimeJson::parse(r#"{"cache_ram_mib": 0}"#).expect("parse");
+        let parsed = WrappedRuntimeJson::parse(r#"{"cache_ram_mib": 0}"#).expect("parse");
         assert_eq!(parsed.cli.cache_ram_mib, Some(0));
         assert_eq!(parsed.launch, PersistedLaunchConfig::default());
     }

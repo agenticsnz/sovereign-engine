@@ -50,10 +50,7 @@ pub fn routes(state: Arc<AppState>) -> Router {
         .route("/models/{id}", put(update_model).delete(delete_model))
         // Phase 7: backend crash diagnostics
         .route("/models/{id}/crash_history", get(get_crash_history))
-        .route(
-            "/models/{id}/crash_log/{occurred_at}",
-            get(get_crash_log),
-        )
+        .route("/models/{id}/crash_log/{occurred_at}", get(get_crash_log))
         // User management
         .route("/users", get(list_users))
         .route("/users/{id}", put(update_user))
@@ -1522,7 +1519,10 @@ async fn get_crash_log(
     match tokio::fs::read(&log_path).await {
         Ok(bytes) => (
             StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
             bytes,
         )
             .into_response(),

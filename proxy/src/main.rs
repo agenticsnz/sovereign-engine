@@ -578,10 +578,12 @@ fn build_router(state: Arc<AppState>) -> Router {
     let ui_path = state.config.ui_path.clone();
 
     // /portal static service. Wrap in a Router so we can attach the strict CORS
-    // layer (nest_service takes a Service, but layering is cleaner via Router).
+    // layer. Use fallback_service for the ServeDir — axum 0.7+ forbids
+    // nest_service("/", ...) ("Nesting at the root is no longer supported").
+    // Every request reaching portal_routes falls through to ServeDir, which
+    // serves files from ui_path with index.html as the SPA fallback.
     let portal_routes = Router::new()
-        .nest_service(
-            "/",
+        .fallback_service(
             tower_http::services::ServeDir::new(&ui_path).fallback(
                 tower_http::services::ServeFile::new(format!("{}/index.html", ui_path)),
             ),

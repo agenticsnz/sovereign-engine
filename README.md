@@ -2,7 +2,7 @@
 
 Self-contained local AI inference platform. A Rust reverse proxy manages llama.cpp backend containers, provides OIDC authentication, fair-use scheduling, and a React dashboard — all in a single Docker image.
 
-**Version:** 1.8.0
+**Version:** 1.8.1
 
 ## Features
 

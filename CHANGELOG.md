@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.1] - 2026-05-04
+
+### Fixed
+- **`GET /portal/` returned 404**, breaking both `api.agentics.org.nz` (root redirects to `/portal/`) and `chat.agentics.org.nz` (proxied through the same path). Root cause: axum 0.8's `Router::nest("/portal", router)` does not dispatch the trailing-slash-only path `/portal/` to the nested router — axum returns its own 404 before the nested router is consulted. Fix: register an explicit `route("/portal/", handler)` directly in `api_router` (subdomain mode) and the single-host router. Regression tests added: `portal_root_trailing_slash_returns_200`, `portal_root_no_trailing_slash_not_404`, `portal_spa_subroute_returns_200`.
+
 ## [1.8.0] - 2026-04-29
 
 ### Fixed

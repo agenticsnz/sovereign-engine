@@ -738,8 +738,7 @@ async fn diag_portal_route_slash_matching() {
             axum::routing::get(move |req: Request<Body>| {
                 let captured = seen_path_clone.clone();
                 async move {
-                    *captured.lock().unwrap() =
-                        Some(req.uri().path().to_string());
+                    *captured.lock().unwrap() = Some(req.uri().path().to_string());
                     axum::http::StatusCode::OK
                 }
             }),
@@ -749,12 +748,10 @@ async fn diag_portal_route_slash_matching() {
             axum::http::StatusCode::NOT_FOUND
         });
 
-    let outer = Router::new()
-        .nest("/portal", inner)
-        .route(
-            "/",
-            axum::routing::get(|| async { axum::response::Redirect::permanent("/portal/") }),
-        );
+    let outer = Router::new().nest("/portal", inner).route(
+        "/",
+        axum::routing::get(|| async { axum::response::Redirect::permanent("/portal/") }),
+    );
 
     // Test /portal/
     let req = Request::builder()

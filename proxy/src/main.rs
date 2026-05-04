@@ -607,9 +607,10 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
     };
 
     let portal_routes = Router::new()
-        .fallback_service(tower_http::services::ServeDir::new(&ui_path).fallback(
-            tower_http::services::ServeFile::new(&index_path),
-        ))
+        .fallback_service(
+            tower_http::services::ServeDir::new(&ui_path)
+                .fallback(tower_http::services::ServeFile::new(&index_path)),
+        )
         .layer(strict_cors.clone());
 
     // Open WebUI reverse proxy (session auth with redirect for browsers) — strict CORS.

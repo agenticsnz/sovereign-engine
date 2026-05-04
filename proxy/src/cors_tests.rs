@@ -609,3 +609,172 @@ async fn build_router_constructs_in_dev_mode() {
     let _router = build_router(state);
     // Pass: build_router returned without panicking.
 }
+
+// ---------------------------------------------------------------------------
+// Portal static-file serving tests
+// ---------------------------------------------------------------------------
+// These tests guard against regressions in the portal's ServeDir wiring.
+// The critical case is `GET /portal/` (trailing slash) in subdomain dispatch
+// mode — ServeDir must serve index.html and return 200, not 404.
+
+/// Helper: create a minimal temp UI directory with an index.html.
+fn make_temp_ui() -> tempfile::TempDir {
+    let ui_dir = tempfile::TempDir::new().expect("temp dir");
+    std::fs::write(
+        ui_dir.path().join("index.html"),
+        b"<!doctype html><html><body>portal</body></html>",
+    )
+    .expect("write index.html");
+    ui_dir
+}
+
+/// Helper: build an AppState whose ui_path points at the given directory.
+async fn app_state_with_ui(ui_path: &str) -> Arc<AppState> {
+    let db = Database::test_db().await;
+    let (probe_tx, _probe_rx) = crate::supervisor::channel();
+    let mut config = test_config();
+    config.ui_path = ui_path.to_string();
+    Arc::new(AppState {
+        config,
+        db,
+        docker: DockerManager::test_dummy(),
+        scheduler: Scheduler::new(),
+        metrics: MetricsBroadcaster::new(),
+        reservations: ReservationBroadcaster::new(),
+        supervisor_map: Arc::new(dashmap::DashMap::new()),
+        probe_tx,
+        worked_map: Arc::new(dashmap::DashMap::new()),
+    })
+}
+
+/// `GET /portal/` (trailing slash) must return HTTP 200 in subdomain mode.
+///
+/// Regression: ServeDir returned 404 for the directory root when called via
+/// axum's subdomain Host-dispatch. The user saw this as "portal is a 404"
+/// because the root `/` redirects to `/portal/` which was 404.
+#[tokio::test]
+async fn portal_root_trailing_slash_returns_200() {
+    let ui_dir = make_temp_ui();
+    let state = app_state_with_ui(ui_dir.path().to_str().unwrap()).await;
+    let router = build_router(state);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/portal/")
+        .header("host", "api.test.local")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "GET /portal/ must serve index.html with 200 (not 404)"
+    );
+}
+
+/// `GET /portal` (no trailing slash) must not return 404.
+/// Acceptable responses: 200 (served directly) or 3xx redirect to /portal/.
+#[tokio::test]
+async fn portal_root_no_trailing_slash_not_404() {
+    let ui_dir = make_temp_ui();
+    let state = app_state_with_ui(ui_dir.path().to_str().unwrap()).await;
+    let router = build_router(state);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/portal")
+        .header("host", "api.test.local")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = router.oneshot(req).await.unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "GET /portal must not return 404 (got {})",
+        resp.status()
+    );
+}
+
+/// SPA sub-routes (`GET /portal/tokens`) must return 200 via the ServeDir
+/// fallback: file doesn't exist → serve index.html for client-side routing.
+#[tokio::test]
+async fn portal_spa_subroute_returns_200() {
+    let ui_dir = make_temp_ui();
+    let state = app_state_with_ui(ui_dir.path().to_str().unwrap()).await;
+    let router = build_router(state);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/portal/tokens")
+        .header("host", "api.test.local")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "GET /portal/tokens must serve index.html via SPA fallback (got {})",
+        resp.status()
+    );
+}
+
+/// Diagnostic: what path does portal_routes actually see for GET /portal/?
+/// This minimal test isolates the nest + fallback dispatch chain.
+#[tokio::test]
+async fn diag_portal_route_slash_matching() {
+    use std::sync::Arc as StdArc;
+    use std::sync::Mutex;
+
+    // Record the path that reaches the "/" route handler.
+    let seen_path: StdArc<Mutex<Option<String>>> = StdArc::new(Mutex::new(None));
+    let seen_path_clone = seen_path.clone();
+
+    let inner = Router::new()
+        .route(
+            "/",
+            axum::routing::get(move |req: Request<Body>| {
+                let captured = seen_path_clone.clone();
+                async move {
+                    *captured.lock().unwrap() =
+                        Some(req.uri().path().to_string());
+                    axum::http::StatusCode::OK
+                }
+            }),
+        )
+        .fallback(|req: Request<Body>| async move {
+            eprintln!("  [diag] fallback hit, path={}", req.uri().path());
+            axum::http::StatusCode::NOT_FOUND
+        });
+
+    let outer = Router::new()
+        .nest("/portal", inner)
+        .route(
+            "/",
+            axum::routing::get(|| async { axum::response::Redirect::permanent("/portal/") }),
+        );
+
+    // Test /portal/
+    let req = Request::builder()
+        .method("GET")
+        .uri("/portal/")
+        .body(Body::empty())
+        .unwrap();
+    let resp = outer.clone().oneshot(req).await.unwrap();
+    eprintln!(
+        "[diag] GET /portal/ -> {}, route saw path: {:?}",
+        resp.status(),
+        seen_path.lock().unwrap()
+    );
+
+    // Test /portal
+    let req2 = Request::builder()
+        .method("GET")
+        .uri("/portal")
+        .body(Body::empty())
+        .unwrap();
+    let resp2 = outer.oneshot(req2).await.unwrap();
+    eprintln!("[diag] GET /portal -> {}", resp2.status());
+}

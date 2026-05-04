@@ -576,15 +576,39 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
         .layer(bearer_cors.clone());
 
     let ui_path = state.config.ui_path.clone();
+    let index_path = format!("{}/index.html", ui_path);
 
     // /portal static service. Wrap in a Router so we can attach the strict CORS
-    // layer. Use fallback_service for the ServeDir — axum 0.7+ forbids
+    // layer. Use fallback_service for the ServeDir — axum 0.8 forbids
     // nest_service("/", ...) ("Nesting at the root is no longer supported").
-    // Every request reaching portal_routes falls through to ServeDir, which
-    // serves files from ui_path with index.html as the SPA fallback.
+    //
+    // axum 0.8 DOES NOT dispatch to a nested router for the exact path "/portal/"
+    // (trailing slash, no further content). The nest prefix match skips it and
+    // axum returns its own 404. The fix is to register an explicit route for
+    // "/portal/" directly in each parent router (see below). fallback_service
+    // handles every other portal path: SPA sub-routes (/portal/tokens etc.) and
+    // static assets (/portal/assets/*).
+    let portal_root_handler = {
+        let ip = index_path.clone();
+        axum::routing::get(move || {
+            let p = ip.clone();
+            async move {
+                match tokio::fs::read(&p).await {
+                    Ok(bytes) => (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                        bytes,
+                    )
+                        .into_response(),
+                    Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                }
+            }
+        })
+    };
+
     let portal_routes = Router::new()
         .fallback_service(tower_http::services::ServeDir::new(&ui_path).fallback(
-            tower_http::services::ServeFile::new(format!("{}/index.html", ui_path)),
+            tower_http::services::ServeFile::new(&index_path),
         ))
         .layer(strict_cors.clone());
 
@@ -613,6 +637,9 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
     if state.config.api_hostname == state.config.chat_hostname {
         return shared_layers(
             Router::new()
+                // Explicit route for /portal/ — axum 0.8 nest() does not dispatch
+                // the trailing-slash-only path to the nested router.
+                .route("/portal/", portal_root_handler.clone())
                 .nest("/auth", auth_routes)
                 .nest("/api", api_routes)
                 .nest("/v1", openai_routes)
@@ -628,6 +655,9 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
             "/",
             axum::routing::get(|| async { axum::response::Redirect::permanent("/portal/") }),
         )
+        // Explicit route for /portal/ — axum 0.8 nest() does not dispatch the
+        // trailing-slash-only path to the nested router (returns its own 404).
+        .route("/portal/", portal_root_handler)
         .nest("/auth", auth_routes)
         .nest("/api", api_routes)
         .nest("/v1", openai_routes)
